@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use jamsession::config::Config;
 use jamsession::daemon::Daemon;
 use jamsession::db::Store;
@@ -28,9 +28,64 @@ enum Command {
     Acp,
     /// Kill a running daemon
     Kill,
+    /// Remove all runtime state (kill daemon, delete db, logs, sessions)
+    Clean {
+        /// Skip confirmation prompt
+        #[arg(short, long)]
+        force: bool,
+    },
+    /// Inspect recorded ACP traces
+    Debug {
+        #[command(subcommand)]
+        command: DebugCommand,
+    },
 }
 
-fn init_daemon_logging(config_dir: &Path) {
+#[derive(Subcommand)]
+enum DebugCommand {
+    /// Serve the local trace debug viewer
+    Serve {
+        /// Path to the SQLite database
+        #[arg(long)]
+        db_path: Option<PathBuf>,
+        /// Localhost port for the viewer
+        #[arg(long, default_value_t = 3000)]
+        port: u16,
+
+        #[command(flatten)]
+        filters: DebugTraceArgs,
+    },
+    /// Dump trace data to stdout as JSON
+    Dump {
+        /// Path to the SQLite database
+        #[arg(long)]
+        db_path: Option<PathBuf>,
+        /// Maximum number of trace rows to emit
+        #[arg(long)]
+        limit: Option<u32>,
+
+        #[command(flatten)]
+        filters: DebugTraceArgs,
+    },
+}
+
+#[derive(Args)]
+struct DebugTraceArgs {
+    /// Filter to a single ACP session ID
+    #[arg(long = "session-id")]
+    session_id: Option<String>,
+    /// Show traces since an RFC3339 timestamp
+    #[arg(long, conflicts_with_all = ["today", "ago"])]
+    since: Option<String>,
+    /// Show traces since midnight UTC today
+    #[arg(long, conflicts_with = "ago")]
+    today: bool,
+    /// Show traces since a relative duration such as 30m, 2h, or 1d
+    #[arg(long)]
+    ago: Option<String>,
+}
+
+fn init_daemon_logging(config_dir: &Path, log_filter: Option<&str>) {
     use jamsession::logging::SessionFileLayer;
     use tracing_subscriber::EnvFilter;
     use tracing_subscriber::layer::SubscriberExt;
@@ -44,7 +99,8 @@ fn init_daemon_logging(config_dir: &Path) {
     // Leak the guard so it lives for the process lifetime
     std::mem::forget(_guard);
 
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(log_filter.unwrap_or("info")));
 
     tracing_subscriber::registry()
         .with(filter)
@@ -54,6 +110,9 @@ fn init_daemon_logging(config_dir: &Path) {
 }
 
 fn default_config_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("JAMSESSION_DIR") {
+        return PathBuf::from(dir);
+    }
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".jamsession")
@@ -66,9 +125,16 @@ async fn main() {
 
     match cli.command.unwrap_or(Command::Daemon { db_path: None }) {
         Command::Daemon { db_path } => {
-            init_daemon_logging(&config_dir);
-
             let config = Config::load(&config_dir);
+            for (key, value) in config.daemon_env() {
+                // SAFETY: called at startup before spawning threads.
+                unsafe { std::env::set_var(key, value) };
+            }
+            init_daemon_logging(&config_dir, config.log_filter());
+            let idle_timeout = config.idle_timeout();
+            let quiescence_timeout = config.quiescence_timeout();
+            let default_model = config.default_model().map(String::from);
+            let trace = config.trace();
             let factory = config.into_factory();
 
             let db_path = db_path.unwrap_or_else(|| config_dir.join("jamsession.db"));
@@ -84,7 +150,12 @@ async fn main() {
                 }
             };
 
-            let daemon = Daemon::new_with_store(store, &socket_path).with_factory(factory);
+            let daemon = Daemon::new_with_store(store, &socket_path)
+                .with_factory(factory)
+                .with_idle_timeout(idle_timeout)
+                .with_quiescence_timeout(quiescence_timeout)
+                .with_default_model(default_model)
+                .with_trace(trace);
 
             let shutdown = tokio::signal::ctrl_c();
             tokio::select! {
@@ -106,6 +177,66 @@ async fn main() {
         Command::Kill => {
             kill_daemon(&config_dir);
         }
+        Command::Clean { force } => {
+            clean(&config_dir, force);
+        }
+        Command::Debug { command } => {
+            tracing_subscriber::fmt::init();
+            match command {
+                DebugCommand::Serve {
+                    db_path,
+                    port,
+                    filters,
+                } => {
+                    let filters = debug_filters_from_args(filters);
+                    let db_path = db_path.unwrap_or_else(|| config_dir.join("jamsession.db"));
+                    if let Err(e) =
+                        jamsession::debug::run_debug_server(&db_path, port, filters).await
+                    {
+                        eprintln!("debug server error: {e}");
+                        std::process::exit(1);
+                    }
+                }
+                DebugCommand::Dump {
+                    db_path,
+                    limit,
+                    filters,
+                } => {
+                    let filters = debug_filters_from_args(filters);
+                    let db_path = db_path.unwrap_or_else(|| config_dir.join("jamsession.db"));
+                    if let Err(e) = jamsession::debug::dump_traces(&db_path, filters, limit).await {
+                        eprintln!("debug dump error: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn debug_filters_from_args(args: DebugTraceArgs) -> jamsession::debug::DebugFilters {
+    let since = match (args.since, args.today, args.ago) {
+        (Some(since), _, _) => match jamsession::debug::parse_since(&since) {
+            Ok(since) => Some(since),
+            Err(e) => {
+                eprintln!("invalid --since: {e}");
+                std::process::exit(2);
+            }
+        },
+        (None, true, _) => Some(jamsession::debug::midnight_today_utc()),
+        (None, false, Some(ago)) => match jamsession::debug::parse_ago(&ago) {
+            Ok(since) => Some(since),
+            Err(e) => {
+                eprintln!("invalid --ago: {e}");
+                std::process::exit(2);
+            }
+        },
+        (None, false, None) => None,
+    };
+
+    jamsession::debug::DebugFilters {
+        session_id: args.session_id,
+        since,
     }
 }
 
@@ -167,6 +298,106 @@ async fn auto_start_daemon(
     }
 
     Err("daemon did not start in time".into())
+}
+
+fn clean(config_dir: &Path, force: bool) {
+    use std::io::Write;
+
+    let db_path = config_dir.join("jamsession.db");
+    let socket_path = config_dir.join("daemon.sock");
+    let pid_path = config_dir.join("daemon.pid");
+    let sessions_dir = config_dir.join("sessions");
+
+    // Collect log files (daemon.log and any rotated variants)
+    let log_files: Vec<PathBuf> = std::fs::read_dir(config_dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("daemon.log"))
+        })
+        .collect();
+
+    let has_daemon = pid_path.exists();
+    let has_db = db_path.exists();
+    let has_socket = socket_path.exists();
+    let has_sessions = sessions_dir.exists();
+    let has_logs = !log_files.is_empty();
+
+    if !has_daemon && !has_db && !has_socket && !has_sessions && !has_logs {
+        eprintln!("nothing to clean in {}", config_dir.display());
+        return;
+    }
+
+    if !force {
+        eprintln!(
+            "This will remove all jamsession runtime state in {}:",
+            config_dir.display()
+        );
+        if has_daemon {
+            eprintln!("  - Kill the running daemon (pid file exists)");
+        }
+        if has_db {
+            eprintln!("  - Delete database: {}", db_path.display());
+        }
+        if has_socket {
+            eprintln!("  - Delete socket: {}", socket_path.display());
+        }
+        if has_sessions {
+            eprintln!("  - Delete per-session logs: {}", sessions_dir.display());
+        }
+        if has_logs {
+            eprintln!("  - Delete {} log file(s)", log_files.len());
+        }
+        eprint!("\nProceed? [y/N] ");
+        std::io::stderr().flush().unwrap();
+
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer).unwrap();
+        if !answer.trim().eq_ignore_ascii_case("y") {
+            eprintln!("aborted");
+            return;
+        }
+    }
+
+    // Kill daemon first so it doesn't recreate files
+    if has_daemon {
+        kill_daemon(config_dir);
+        // Give it a moment to shut down
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    if has_db {
+        match std::fs::remove_file(&db_path) {
+            Ok(()) => eprintln!("removed {}", db_path.display()),
+            Err(e) => eprintln!("failed to remove {}: {e}", db_path.display()),
+        }
+    }
+    if has_socket {
+        match std::fs::remove_file(&socket_path) {
+            Ok(()) => eprintln!("removed {}", socket_path.display()),
+            Err(e) => eprintln!("failed to remove {}: {e}", socket_path.display()),
+        }
+    }
+    if has_sessions {
+        match std::fs::remove_dir_all(&sessions_dir) {
+            Ok(()) => eprintln!("removed {}", sessions_dir.display()),
+            Err(e) => eprintln!("failed to remove {}: {e}", sessions_dir.display()),
+        }
+    }
+    for log_file in &log_files {
+        match std::fs::remove_file(log_file) {
+            Ok(()) => eprintln!("removed {}", log_file.display()),
+            Err(e) => eprintln!("failed to remove {}: {e}", log_file.display()),
+        }
+    }
+    // Clean up pid file if it's still around
+    let _ = std::fs::remove_file(&pid_path);
+
+    eprintln!("clean complete");
 }
 
 fn write_pid_file(config_dir: &Path) {

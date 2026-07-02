@@ -27,7 +27,7 @@ Or let it auto-start -- when you run in ACP client mode and the daemon isn't run
 jamsession acp
 ```
 
-The daemon listens on `~/.jamsession/daemon.sock` and logs to `~/.jamsession/daemon.log`.
+The daemon listens on `~/.jamsession/daemon.sock` and logs to `~/.jamsession/daemon.log`. Set `JAMSESSION_DIR` to use a different directory (useful for isolated test instances).
 
 ## Creating a session
 
@@ -70,3 +70,20 @@ jamsession acp
 ```
 
 If the daemon isn't running, it will be started automatically.
+
+## Debugging message flow
+
+Enable trace recording in `~/.jamsession/config.toml`:
+
+```toml
+[daemon]
+trace = true
+```
+
+Restart the daemon, exercise a session, then open the local trace viewer:
+
+```sh
+jamsession debug serve
+```
+
+The viewer listens on `http://127.0.0.1:3000` by default and live-polls trace rows from `~/.jamsession/jamsession.db`. Use `--session-id`, `--since`, `--today`, or `--ago 30m` to narrow the initial view. Use `jamsession debug dump` with the same filters to emit trace JSON to stdout.
