@@ -28,6 +28,12 @@ enum Command {
     Acp,
     /// Kill a running daemon
     Kill,
+    /// Remove all runtime state (kill daemon, delete db, logs, sessions)
+    Clean {
+        /// Skip confirmation prompt
+        #[arg(short, long)]
+        force: bool,
+    },
     /// Inspect recorded ACP traces
     Debug {
         #[command(subcommand)]
@@ -104,6 +110,9 @@ fn init_daemon_logging(config_dir: &Path, log_filter: Option<&str>) {
 }
 
 fn default_config_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("JAMSESSION_DIR") {
+        return PathBuf::from(dir);
+    }
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".jamsession")
@@ -167,6 +176,9 @@ async fn main() {
         }
         Command::Kill => {
             kill_daemon(&config_dir);
+        }
+        Command::Clean { force } => {
+            clean(&config_dir, force);
         }
         Command::Debug { command } => {
             tracing_subscriber::fmt::init();
@@ -286,6 +298,103 @@ async fn auto_start_daemon(
     }
 
     Err("daemon did not start in time".into())
+}
+
+fn clean(config_dir: &Path, force: bool) {
+    use std::io::Write;
+
+    let db_path = config_dir.join("jamsession.db");
+    let socket_path = config_dir.join("daemon.sock");
+    let pid_path = config_dir.join("daemon.pid");
+    let sessions_dir = config_dir.join("sessions");
+
+    // Collect log files (daemon.log and any rotated variants)
+    let log_files: Vec<PathBuf> = std::fs::read_dir(config_dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("daemon.log"))
+        })
+        .collect();
+
+    let has_daemon = pid_path.exists();
+    let has_db = db_path.exists();
+    let has_socket = socket_path.exists();
+    let has_sessions = sessions_dir.exists();
+    let has_logs = !log_files.is_empty();
+
+    if !has_daemon && !has_db && !has_socket && !has_sessions && !has_logs {
+        eprintln!("nothing to clean in {}", config_dir.display());
+        return;
+    }
+
+    if !force {
+        eprintln!("This will remove all jamsession runtime state in {}:", config_dir.display());
+        if has_daemon {
+            eprintln!("  - Kill the running daemon (pid file exists)");
+        }
+        if has_db {
+            eprintln!("  - Delete database: {}", db_path.display());
+        }
+        if has_socket {
+            eprintln!("  - Delete socket: {}", socket_path.display());
+        }
+        if has_sessions {
+            eprintln!("  - Delete per-session logs: {}", sessions_dir.display());
+        }
+        if has_logs {
+            eprintln!("  - Delete {} log file(s)", log_files.len());
+        }
+        eprint!("\nProceed? [y/N] ");
+        std::io::stderr().flush().unwrap();
+
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer).unwrap();
+        if !answer.trim().eq_ignore_ascii_case("y") {
+            eprintln!("aborted");
+            return;
+        }
+    }
+
+    // Kill daemon first so it doesn't recreate files
+    if has_daemon {
+        kill_daemon(config_dir);
+        // Give it a moment to shut down
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    if has_db {
+        match std::fs::remove_file(&db_path) {
+            Ok(()) => eprintln!("removed {}", db_path.display()),
+            Err(e) => eprintln!("failed to remove {}: {e}", db_path.display()),
+        }
+    }
+    if has_socket {
+        match std::fs::remove_file(&socket_path) {
+            Ok(()) => eprintln!("removed {}", socket_path.display()),
+            Err(e) => eprintln!("failed to remove {}: {e}", socket_path.display()),
+        }
+    }
+    if has_sessions {
+        match std::fs::remove_dir_all(&sessions_dir) {
+            Ok(()) => eprintln!("removed {}", sessions_dir.display()),
+            Err(e) => eprintln!("failed to remove {}: {e}", sessions_dir.display()),
+        }
+    }
+    for log_file in &log_files {
+        match std::fs::remove_file(log_file) {
+            Ok(()) => eprintln!("removed {}", log_file.display()),
+            Err(e) => eprintln!("failed to remove {}: {e}", log_file.display()),
+        }
+    }
+    // Clean up pid file if it's still around
+    let _ = std::fs::remove_file(&pid_path);
+
+    eprintln!("clean complete");
 }
 
 fn write_pid_file(config_dir: &Path) {
