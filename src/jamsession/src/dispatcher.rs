@@ -647,10 +647,9 @@ impl<'scope> Dispatcher<'scope> {
             );
             if let Ok(msg) = agent_client_protocol::UntypedMessage::new("session/update", &notif)
                 && let Ok(value) = serde_json::to_value(&msg)
+                && let Err(e) = self.store.append_message(session_id, &value).await
             {
-                if let Err(e) = self.store.append_message(session_id, &value).await {
-                    tracing::error!(session_id, error = %e, "failed to persist user message");
-                }
+                tracing::error!(session_id, error = %e, "failed to persist user message");
             }
         }
     }
