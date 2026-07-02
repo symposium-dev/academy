@@ -39,6 +39,34 @@ pub async fn run_debug_server(
     }
 }
 
+pub async fn dump_traces(
+    db_path: &Path,
+    filters: DebugFilters,
+    limit: Option<u32>,
+) -> crate::error::Result<()> {
+    let body = dump_traces_json(db_path, filters, limit).await?;
+    println!("{}", serde_json::to_string_pretty(&body)?);
+    Ok(())
+}
+
+pub async fn dump_traces_json(
+    db_path: &Path,
+    filters: DebugFilters,
+    limit: Option<u32>,
+) -> crate::error::Result<serde_json::Value> {
+    let store = Store::open(db_path).await?;
+    let traces = store
+        .traces(TraceQuery {
+            session_id: filters.session_id,
+            since: filters.since,
+            limit,
+            ..TraceQuery::default()
+        })
+        .await?;
+
+    Ok(serde_json::json!({ "traces": traces }))
+}
+
 async fn handle_connection(
     mut stream: TcpStream,
     store: Store,
@@ -278,6 +306,57 @@ mod tests {
 
     #[tokio::test]
     async fn api_traces_returns_filtered_rows() {
+        let (_dir, _db_path, store) = seeded_trace_store().await;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_store = store.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_connection(stream, server_store, DebugFilters::default())
+                .await
+                .unwrap();
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(b"GET /api/traces?session=sess-1 HTTP/1.1\r\nhost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut body = String::new();
+        client.read_to_string(&mut body).await.unwrap();
+        server.await.unwrap();
+
+        let (_, json) = body.split_once("\r\n\r\n").unwrap();
+        let response: serde_json::Value = serde_json::from_str(json).unwrap();
+        let traces = response["traces"].as_array().unwrap();
+        assert_eq!(traces.len(), 1);
+        assert_eq!(traces[0]["session_id"], "sess-1");
+        assert_eq!(traces[0]["method"], "session/prompt");
+    }
+
+    #[tokio::test]
+    async fn dump_traces_returns_filtered_rows() {
+        let (_dir, db_path, _store) = seeded_trace_store().await;
+
+        let response = dump_traces_json(
+            &db_path,
+            DebugFilters {
+                session_id: Some("sess-1".to_string()),
+                since: None,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let traces = response["traces"].as_array().unwrap();
+
+        assert_eq!(traces.len(), 1);
+        assert_eq!(traces[0]["session_id"], "sess-1");
+        assert_eq!(traces[0]["method"], "session/prompt");
+    }
+
+    async fn seeded_trace_store() -> (tempfile::TempDir, std::path::PathBuf, Store) {
         let dir = tempfile::TempDir::new().unwrap();
         let db_path = dir.path().join("jamsession.db");
         let store = Store::open(&db_path).await.unwrap();
@@ -306,30 +385,6 @@ mod tests {
             .await
             .unwrap();
 
-        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server_store = store.clone();
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            handle_connection(stream, server_store, DebugFilters::default())
-                .await
-                .unwrap();
-        });
-
-        let mut client = TcpStream::connect(addr).await.unwrap();
-        client
-            .write_all(b"GET /api/traces?session=sess-1 HTTP/1.1\r\nhost: localhost\r\n\r\n")
-            .await
-            .unwrap();
-        let mut body = String::new();
-        client.read_to_string(&mut body).await.unwrap();
-        server.await.unwrap();
-
-        let (_, json) = body.split_once("\r\n\r\n").unwrap();
-        let response: serde_json::Value = serde_json::from_str(json).unwrap();
-        let traces = response["traces"].as_array().unwrap();
-        assert_eq!(traces.len(), 1);
-        assert_eq!(traces[0]["session_id"], "sess-1");
-        assert_eq!(traces[0]["method"], "session/prompt");
+        (dir, db_path, store)
     }
 }

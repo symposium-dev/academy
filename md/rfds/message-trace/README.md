@@ -159,16 +159,17 @@ trace = true
 
 Tracing is opt-in. When disabled, no trace rows are written to the database.
 
-### Debug Viewer: `jamsession debug`
+### Trace Inspection: `jamsession debug`
 
-A subcommand that serves a web page (localhost only) rendering trace data from the database:
+The debug command can serve a web page (localhost only) or dump trace data as JSON:
 
 ```
-jamsession debug [--port 3000] [--session <id>] [--since <time>] [--today] [--ago <duration>]
+jamsession debug serve [--port 3000] [--session-id <id>] [--since <time>] [--today] [--ago <duration>]
+jamsession debug dump [--session-id <id>] [--since <time>] [--today] [--ago <duration>] [--limit <limit>]
 ```
 
 Time filters:
-- `--since 2026-06-30T10:00:00` — absolute timestamp (parsed via `jiff`)
+- `--since 2026-06-30T10:00:00` — absolute timestamp (parsed via `chrono`)
 - `--today` — shorthand for midnight today
 - `--ago 1h` — relative duration (e.g., `30m`, `2h`, `1d`)
 
@@ -379,7 +380,7 @@ Add the `Debug` variant to the CLI. Localhost server with `GET /` (embedded HTML
 
 **Test (red first)**: Start the server programmatically in a test, insert some traces into the store, fetch `/api/traces?session=X`, assert the JSON response matches what `store.query_traces` would return. This tests the HTTP layer as a public interface without mocking.
 
-- [x] Add `Debug` command with `--port`, `--session`, `--since`, `--today`, `--ago` args
+- [x] Add `Debug` command with `serve` and `dump` subcommands plus `--port`, `--session-id`, `--since`, `--today`, `--ago` args
 - [x] Time parsing via existing `chrono` dependency
 - [x] Localhost server: `GET /` serves embedded HTML, `GET /api/traces` queries store
 - [x] Integration test: insert traces → HTTP GET → assert JSON
@@ -390,7 +391,7 @@ Add the `Debug` variant to the CLI. Localhost server with `GET /` (embedded HTML
 
 Embedded single-page app. Polls `/api/traces?after_id=N` every 200ms for live tailing.
 
-No automated tests — verify by running `jamsession debug` against a real or test session.
+No automated tests — verify by running `jamsession debug serve` against a real or test session.
 
 - [x] `viewer.html` with inline CSS/JS
 - [x] SVG swimlane rendering (client / daemon / agent columns)
@@ -418,7 +419,7 @@ Current production slice:
 - Added `Store::record_trace`, `Store::traces`, `TraceQuery`, and `TraceRecord`.
 - Added `trace = true` to `[daemon]` config and threaded it through `Daemon` into the dispatcher.
 - Recorded opt-in trace rows for client/agent dispatch flow, local daemon responses, and lifecycle events.
-- Added `jamsession debug` with `--port`, `--session`, `--since`, `--today`, and `--ago`.
+- The debug CLI provides `serve` and `dump` subcommands with `--session-id`, `--since`, `--today`, and `--ago`.
 - Added a localhost-only static HTML/JS viewer that polls `/api/traces` every 200ms and supports session/method/direction filters.
 - Documented `trace` and `jamsession debug` in the user and design guides.
 

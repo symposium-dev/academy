@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use jamsession::config::Config;
 use jamsession::daemon::Daemon;
 use jamsession::db::Store;
@@ -28,27 +28,55 @@ enum Command {
     Acp,
     /// Kill a running daemon
     Kill,
-    /// Serve the local trace debug viewer
+    /// Inspect recorded ACP traces
     Debug {
+        #[command(subcommand)]
+        command: DebugCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum DebugCommand {
+    /// Serve the local trace debug viewer
+    Serve {
         /// Path to the SQLite database
         #[arg(long)]
         db_path: Option<PathBuf>,
         /// Localhost port for the viewer
         #[arg(long, default_value_t = 3000)]
         port: u16,
-        /// Filter to a single ACP session ID
-        #[arg(long)]
-        session: Option<String>,
-        /// Show traces since an RFC3339 timestamp
-        #[arg(long, conflicts_with_all = ["today", "ago"])]
-        since: Option<String>,
-        /// Show traces since midnight UTC today
-        #[arg(long, conflicts_with = "ago")]
-        today: bool,
-        /// Show traces since a relative duration such as 30m, 2h, or 1d
-        #[arg(long)]
-        ago: Option<String>,
+
+        #[command(flatten)]
+        filters: DebugTraceArgs,
     },
+    /// Dump trace data to stdout as JSON
+    Dump {
+        /// Path to the SQLite database
+        #[arg(long)]
+        db_path: Option<PathBuf>,
+        /// Maximum number of trace rows to emit
+        #[arg(long)]
+        limit: Option<u32>,
+
+        #[command(flatten)]
+        filters: DebugTraceArgs,
+    },
+}
+
+#[derive(Args)]
+struct DebugTraceArgs {
+    /// Filter to a single ACP session ID
+    #[arg(long = "session-id")]
+    session_id: Option<String>,
+    /// Show traces since an RFC3339 timestamp
+    #[arg(long, conflicts_with_all = ["today", "ago"])]
+    since: Option<String>,
+    /// Show traces since midnight UTC today
+    #[arg(long, conflicts_with = "ago")]
+    today: bool,
+    /// Show traces since a relative duration such as 30m, 2h, or 1d
+    #[arg(long)]
+    ago: Option<String>,
 }
 
 fn init_daemon_logging(config_dir: &Path, log_filter: Option<&str>) {
@@ -140,43 +168,63 @@ async fn main() {
         Command::Kill => {
             kill_daemon(&config_dir);
         }
-        Command::Debug {
-            db_path,
-            port,
-            session,
-            since,
-            today,
-            ago,
-        } => {
+        Command::Debug { command } => {
             tracing_subscriber::fmt::init();
-            let since = match (since, today, ago) {
-                (Some(since), _, _) => match jamsession::debug::parse_since(&since) {
-                    Ok(since) => Some(since),
-                    Err(e) => {
-                        eprintln!("invalid --since: {e}");
-                        std::process::exit(2);
+            match command {
+                DebugCommand::Serve {
+                    db_path,
+                    port,
+                    filters,
+                } => {
+                    let filters = debug_filters_from_args(filters);
+                    let db_path = db_path.unwrap_or_else(|| config_dir.join("jamsession.db"));
+                    if let Err(e) =
+                        jamsession::debug::run_debug_server(&db_path, port, filters).await
+                    {
+                        eprintln!("debug server error: {e}");
+                        std::process::exit(1);
                     }
-                },
-                (None, true, _) => Some(jamsession::debug::midnight_today_utc()),
-                (None, false, Some(ago)) => match jamsession::debug::parse_ago(&ago) {
-                    Ok(since) => Some(since),
-                    Err(e) => {
-                        eprintln!("invalid --ago: {e}");
-                        std::process::exit(2);
+                }
+                DebugCommand::Dump {
+                    db_path,
+                    limit,
+                    filters,
+                } => {
+                    let filters = debug_filters_from_args(filters);
+                    let db_path = db_path.unwrap_or_else(|| config_dir.join("jamsession.db"));
+                    if let Err(e) = jamsession::debug::dump_traces(&db_path, filters, limit).await {
+                        eprintln!("debug dump error: {e}");
+                        std::process::exit(1);
                     }
-                },
-                (None, false, None) => None,
-            };
-            let filters = jamsession::debug::DebugFilters {
-                session_id: session,
-                since,
-            };
-            let db_path = db_path.unwrap_or_else(|| config_dir.join("jamsession.db"));
-            if let Err(e) = jamsession::debug::run_debug_server(&db_path, port, filters).await {
-                eprintln!("debug server error: {e}");
-                std::process::exit(1);
+                }
             }
         }
+    }
+}
+
+fn debug_filters_from_args(args: DebugTraceArgs) -> jamsession::debug::DebugFilters {
+    let since = match (args.since, args.today, args.ago) {
+        (Some(since), _, _) => match jamsession::debug::parse_since(&since) {
+            Ok(since) => Some(since),
+            Err(e) => {
+                eprintln!("invalid --since: {e}");
+                std::process::exit(2);
+            }
+        },
+        (None, true, _) => Some(jamsession::debug::midnight_today_utc()),
+        (None, false, Some(ago)) => match jamsession::debug::parse_ago(&ago) {
+            Ok(since) => Some(since),
+            Err(e) => {
+                eprintln!("invalid --ago: {e}");
+                std::process::exit(2);
+            }
+        },
+        (None, false, None) => None,
+    };
+
+    jamsession::debug::DebugFilters {
+        session_id: args.session_id,
+        since,
     }
 }
 

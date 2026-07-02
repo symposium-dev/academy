@@ -101,7 +101,7 @@ Options:
 Commands:
     daemon    Run the daemon (default)
     acp       Run as stdio ACP client (connects to daemon)
-    debug     Serve the local trace debug viewer
+    debug     Inspect recorded ACP traces
     kill      Kill a running daemon
 
 jamsession daemon [OPTIONS]
@@ -110,12 +110,23 @@ Options:
     --db-path <PATH>       Override the SQLite database location
     -h, --help             Print help
 
-jamsession debug [OPTIONS]
+jamsession debug serve [OPTIONS]
 
 Options:
     --db-path <PATH>       Override the SQLite database location
     --port <PORT>          Localhost port for the viewer (default: 3000)
-    --session <ID>         Filter to a single ACP session ID
+    --session-id <ID>      Filter to a single ACP session ID
+    --since <TIMESTAMP>    Show traces since an RFC3339 timestamp
+    --today                Show traces since midnight UTC today
+    --ago <DURATION>       Show traces since a relative duration such as 30m, 2h, or 1d
+    -h, --help             Print help
+
+jamsession debug dump [OPTIONS]
+
+Options:
+    --db-path <PATH>       Override the SQLite database location
+    --limit <LIMIT>        Maximum number of trace rows to emit
+    --session-id <ID>      Filter to a single ACP session ID
     --since <TIMESTAMP>    Show traces since an RFC3339 timestamp
     --today                Show traces since midnight UTC today
     --ago <DURATION>       Show traces since a relative duration such as 30m, 2h, or 1d

@@ -47,7 +47,7 @@ Each page includes anchor code references that link directly to the source.
 | `dispatcher` | `src/dispatcher.rs` | Central dispatcher: message types, session state, routing, timers, trace recording, client/agent pipes |
 | `daemon` | `src/daemon.rs` | Socket listener, database opening, accept loop, scope-based task management |
 | `db` | `src/db.rs` | Toasty models plus SQLite-backed session, message, and trace persistence |
-| `debug` | `src/debug.rs` | Local trace viewer server and `/api/traces` query handling |
+| `debug` | `src/debug.rs` | Local trace viewer server, `/api/traces` query handling, and JSON trace dumps |
 | `agent` | `src/agent.rs` | Agent factory trait, transport creation |
 | `session` | `src/session.rs` | `LifecycleEvent` enum (observable outcomes for tests/tracing) |
 | `eof_signal` | `src/eof_signal.rs` | `EofSignalingTransport` wrapper for disconnect detection |

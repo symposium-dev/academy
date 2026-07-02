@@ -83,7 +83,7 @@ trace = true
 Restart the daemon, exercise a session, then open the local trace viewer:
 
 ```sh
-jamsession debug
+jamsession debug serve
 ```
 
-The viewer listens on `http://127.0.0.1:3000` by default and live-polls trace rows from `~/.jamsession/jamsession.db`. Use `--session`, `--since`, `--today`, or `--ago 30m` to narrow the initial view.
+The viewer listens on `http://127.0.0.1:3000` by default and live-polls trace rows from `~/.jamsession/jamsession.db`. Use `--session-id`, `--since`, `--today`, or `--ago 30m` to narrow the initial view. Use `jamsession debug dump` with the same filters to emit trace JSON to stdout.
