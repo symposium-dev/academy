@@ -27,7 +27,7 @@ Or let it auto-start -- when you run in ACP client mode and the daemon isn't run
 jamsession acp
 ```
 
-The daemon listens on `~/.jamsession/daemon.sock` and logs to `~/.jamsession/daemon.log`.
+The daemon listens on `~/.jamsession/daemon.sock` and logs to `~/.jamsession/daemon.log`. Set `JAMSESSION_DIR` to use a different directory (useful for isolated test instances).
 
 ## Creating a session
 

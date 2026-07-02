@@ -103,6 +103,7 @@ Commands:
     acp       Run as stdio ACP client (connects to daemon)
     debug     Inspect recorded ACP traces
     kill      Kill a running daemon
+    clean     Remove all runtime state (kill daemon, delete db, logs, sessions)
 
 jamsession daemon [OPTIONS]
 
@@ -133,10 +134,21 @@ Options:
     -h, --help             Print help
 ```
 
+```
+jamsession clean [OPTIONS]
+
+Options:
+    -f, --force            Skip confirmation prompt
+    -h, --help             Print help
+```
+
+The `clean` command kills the running daemon and removes all runtime state: database, socket, logs, and per-session logs. It preserves `config.toml`. Without `-f`, it lists what will be deleted and prompts for confirmation.
+
 The `--config-dir` flag redirects all file paths (socket, database, config, logs) to the given directory. Useful for running isolated test instances.
 
 ## Environment variables
 
+- `JAMSESSION_DIR` -- Override the default data directory (`~/.jamsession`). Equivalent to `--config-dir` but as an env var. The CLI flag takes precedence if both are set.
 - `RUST_LOG` -- Overrides the `daemon.log_filter` setting in config.toml (standard `tracing` filter syntax).
 
 ## Idle timeout

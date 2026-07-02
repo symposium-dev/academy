@@ -3,11 +3,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use agent_client_protocol::schema::{
-    ContentChunk, InitializeRequest, InitializeResponse, ListSessionsRequest,
-    ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, McpServer, NewSessionRequest,
-    NewSessionResponse, PromptRequest, ProtocolVersion, ResumeSessionRequest,
-    ResumeSessionResponse, SessionConfigOptionCategory, SessionId as AcpSessionId, SessionInfo,
-    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    ContentChunk, InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
+    LoadSessionRequest, LoadSessionResponse, McpServer, NewSessionRequest, NewSessionResponse,
+    PromptRequest, ProtocolVersion, ResumeSessionRequest, ResumeSessionResponse,
+    SessionConfigOptionCategory, SessionId as AcpSessionId, SessionInfo, SessionNotification,
+    SessionUpdate, SetSessionConfigOptionRequest,
 };
 use agent_client_protocol::util::MatchDispatch;
 use agent_client_protocol::{

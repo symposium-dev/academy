@@ -294,10 +294,7 @@ async fn load_dead_session_respawns_agent_and_replays_history() {
         ))
         .await;
 
-    assert_eq!(
-        result,
-        "user_message_chunk:original prompt|new: follow up"
-    );
+    assert_eq!(result, "user_message_chunk:original prompt|new: follow up");
 }
 
 #[tokio::test(flavor = "multi_thread")]

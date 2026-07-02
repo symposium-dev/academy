@@ -333,7 +333,10 @@ fn clean(config_dir: &Path, force: bool) {
     }
 
     if !force {
-        eprintln!("This will remove all jamsession runtime state in {}:", config_dir.display());
+        eprintln!(
+            "This will remove all jamsession runtime state in {}:",
+            config_dir.display()
+        );
         if has_daemon {
             eprintln!("  - Kill the running daemon (pid file exists)");
         }
