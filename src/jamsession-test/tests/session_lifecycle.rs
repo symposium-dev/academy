@@ -246,6 +246,25 @@ async fn tracing_records_session_lifecycle_and_prompt_flow() {
             && trace.dir == TraceDirection::DaemonToClient
             && trace.method.as_deref() == Some("session/update")
     }));
+    let load_request_trace_id = traces
+        .iter()
+        .find(|trace| {
+            trace.kind == TraceKind::Request
+                && trace.dir == TraceDirection::ClientToDaemon
+                && trace.method.as_deref() == Some("session/load")
+                && trace.request_id.as_deref() == Some("3")
+        })
+        .expect("expected session/load request trace")
+        .id;
+    assert!(
+        traces.iter().any(|trace| {
+            trace.id > load_request_trace_id
+                && trace.kind == TraceKind::Notification
+                && trace.dir == TraceDirection::DaemonToClient
+                && trace.method.as_deref() == Some("session/update")
+        }),
+        "expected replayed session/update trace after session/load"
+    );
     assert!(traces.iter().any(|trace| {
         trace.kind == TraceKind::Event && trace.method.as_deref() == Some("session_loaded")
     }));

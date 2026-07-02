@@ -1197,7 +1197,15 @@ impl<'scope> Dispatcher<'scope> {
             if let Ok(untyped) =
                 serde_json::from_value::<agent_client_protocol::UntypedMessage>(msg)
             {
-                let _ = client.outgoing_tx.send(Dispatch::Notification(untyped));
+                let dispatch = Dispatch::Notification(untyped);
+                self.trace_record_optional(self.trace_dispatch(
+                    Some(session_id.to_string()),
+                    TraceDirection::DaemonToClient,
+                    "acp-client",
+                    &dispatch,
+                ))
+                .await;
+                let _ = client.outgoing_tx.send(dispatch);
             }
         }
 
