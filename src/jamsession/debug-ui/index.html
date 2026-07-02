@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>jamsession trace</title>
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<header>
+<h1>jamsession trace</h1>
+<input id="session" placeholder="session">
+<input id="method" placeholder="method">
+<select id="dir">
+<option value="">any direction</option>
+<option>client_to_daemon</option>
+<option>daemon_to_agent</option>
+<option>agent_to_daemon</option>
+<option>daemon_to_client</option>
+<option>internal</option>
+</select>
+<label><input id="live" type="checkbox" checked> Live</label>
+<label><input id="compact" type="checkbox" checked> Compact</label>
+<button id="zoom-out" title="Zoom out" aria-label="Zoom out">-</button>
+<button id="zoom-reset" title="Reset zoom" aria-label="Reset zoom">100%</button>
+<button id="zoom-in" title="Zoom in" aria-label="Zoom in">+</button>
+<button id="refresh">Refresh</button>
+</header>
+<main>
+<div class="trace-layout">
+<section id="graph-panel">
+  <svg id="diagram" viewBox="0 0 760 240" preserveAspectRatio="xMidYMin meet"></svg>
+</section>
+<aside id="detail">
+  <h2>Selected message</h2>
+  <div id="detail-meta"></div>
+  <pre id="detail-payload">Select a row to inspect the complete payload.</pre>
+</aside>
+</div>
+</main>
+<script src="/app.js"></script>
+</body>
+</html>
