@@ -11,6 +11,8 @@
 
 - [About RFDs](./rfds/README.md)
 - [Accepted](./rfds/accepted.md)
+  - [The `jamsession` MCP tool](./rfds/jamsession-tool/README.md)
+  - [Inter-agent communication](./rfds/inter-agent-communication/README.md)
 - [Completed](./rfds/completed.md)
   - [RFD process](./rfds/rfd-process/README.md)
   - [Session persistence](./rfds/session-persistence/README.md)
