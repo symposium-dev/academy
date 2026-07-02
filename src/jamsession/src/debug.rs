@@ -207,27 +207,40 @@ static VIEWER_HTML: &str = r##"<!doctype html>
 <style>
 :root { color-scheme: dark; font-family: ui-sans-serif, system-ui, sans-serif; background: #111318; color: #d8dee9; }
 body { margin: 0; }
-header { display: flex; gap: 12px; align-items: center; padding: 12px 16px; border-bottom: 1px solid #2b303b; background: #171a21; position: sticky; top: 0; z-index: 1; }
+header { display: flex; gap: 12px; align-items: center; padding: 12px 16px; border-bottom: 1px solid #2b303b; background: #171a21; position: sticky; top: 0; z-index: 1; flex-wrap: wrap; }
 h1 { font-size: 16px; margin: 0 12px 0 0; font-weight: 650; }
 input, select { background: #0f1117; color: #d8dee9; border: 1px solid #3a4050; border-radius: 4px; padding: 6px 8px; }
-button { background: #335c9f; color: white; border: 0; border-radius: 4px; padding: 7px 10px; }
+button { background: #335c9f; color: white; border: 0; border-radius: 4px; padding: 7px 10px; min-width: 34px; }
 label { display: inline-flex; gap: 6px; align-items: center; color: #b6c2d2; font-size: 13px; }
 main { padding: 16px; }
-#diagram { width: 100%; min-height: 220px; border-bottom: 1px solid #2b303b; margin-bottom: 12px; }
-.row { display: grid; grid-template-columns: 64px 118px 150px 150px 120px 1fr; gap: 10px; align-items: start; border-bottom: 1px solid #232833; padding: 8px 0; cursor: pointer; }
-.row:hover, .row.selected, .row.correlated { background: #1b2030; }
-.head { color: #8f98aa; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+#diagram { width: 100%; min-height: 360px; }
+.trace-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(300px, 34vw); gap: 16px; align-items: start; }
+#graph-panel { min-width: 0; border-bottom: 1px solid #2b303b; }
+#detail { position: sticky; top: 72px; max-height: calc(100vh - 92px); overflow: auto; border-left: 1px solid #2b303b; padding-left: 16px; }
+#detail h2 { margin: 0 0 10px; font-size: var(--detail-heading-font, 14px); font-weight: 650; color: #d8dee9; }
+#detail-meta { display: grid; grid-template-columns: var(--detail-label-col, 84px) 1fr; gap: var(--detail-gap-y, 6px) var(--detail-gap-x, 10px); margin-bottom: 12px; color: #b6c2d2; font-size: var(--detail-font, 12px); }
+#detail-meta div:nth-child(odd) { color: #8f98aa; text-transform: uppercase; font-size: var(--detail-label-font, 11px); }
+#detail-payload { display: block; margin: 0; max-height: none; color: #d8dee9; background: #0f1117; border: 1px solid #2b303b; border-radius: 4px; padding: 10px; }
 .request { color: #80bfff; }
 .response { color: #ffd479; }
 .notification { color: #8ce99a; }
 .event { color: #adb5bd; }
-pre { display: none; margin: 8px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; color: #b6c2d2; font-size: 12px; }
-.expanded pre { display: block; }
+pre { display: none; margin: 8px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; color: #b6c2d2; font-size: var(--payload-font, 12px); }
 .lane { stroke: #2b303b; stroke-width: 1; }
 .arrow { stroke-width: 2; fill: none; }
 .event-dot { stroke-width: 2; fill: #171a21; }
-.label { fill: #d8dee9; font-size: 12px; }
-.meta { fill: #8f98aa; font-size: 11px; }
+.trace-mark { cursor: pointer; }
+.trace-mark.correlated { opacity: .55; }
+.trace-mark.selected { opacity: 1; }
+.trace-mark.selected .label { font-weight: 700; }
+.trace-hit { stroke: transparent; fill: none; pointer-events: stroke; }
+.label { fill: #d8dee9; font-size: var(--svg-label-font, 12px); }
+.quote-label { font-style: italic; }
+.meta { fill: #8f98aa; font-size: var(--svg-meta-font, 11px); }
+@media (max-width: 900px) {
+  .trace-layout { grid-template-columns: 1fr; }
+  #detail { position: static; max-height: none; border-left: 0; padding-left: 0; border-top: 1px solid #2b303b; padding-top: 12px; }
+}
 </style>
 </head>
 <body>
@@ -244,20 +257,59 @@ pre { display: none; margin: 8px 0 0; white-space: pre-wrap; overflow-wrap: anyw
 <option>internal</option>
 </select>
 <label><input id="live" type="checkbox" checked> Live</label>
+<label><input id="compact" type="checkbox" checked> Compact</label>
+<button id="zoom-out" title="Zoom out" aria-label="Zoom out">-</button>
+<button id="zoom-reset" title="Reset zoom" aria-label="Reset zoom">100%</button>
+<button id="zoom-in" title="Zoom in" aria-label="Zoom in">+</button>
 <button id="refresh">Refresh</button>
 </header>
 <main>
-<svg id="diagram" viewBox="0 0 760 240" preserveAspectRatio="xMidYMin meet"></svg>
-<div class="row head"><div>id</div><div>time</div><div>direction</div><div>role</div><div>kind</div><div>method / payload</div></div>
-<div id="rows"></div>
+<div class="trace-layout">
+<section id="graph-panel">
+  <svg id="diagram" viewBox="0 0 760 240" preserveAspectRatio="xMidYMin meet"></svg>
+</section>
+<aside id="detail">
+  <h2>Selected message</h2>
+  <div id="detail-meta"></div>
+  <pre id="detail-payload">Select a row to inspect the complete payload.</pre>
+</aside>
+</div>
 </main>
 <script>
 let lastId = 0;
+let zoom = 0.78;
+let selectedTraceId = null;
+let selectedRequestId = null;
 const traces = [];
-const rows = document.querySelector("#rows");
 const diagram = document.querySelector("#diagram");
+const detailMeta = document.querySelector("#detail-meta");
+const detailPayload = document.querySelector("#detail-payload");
 const lanes = { "acp-client": 110, "daemon": 380, "agent": 650 };
 const palette = ["#80bfff", "#ffd479", "#8ce99a", "#ff8787", "#b197fc", "#66d9e8"];
+function clamp(n, min, max) {
+  return Math.min(max, Math.max(min, n));
+}
+function compactEnabled() {
+  return document.querySelector("#compact").checked;
+}
+function rowStep() {
+  return (compactEnabled() ? 22 : 32) * zoom;
+}
+function applyZoom(next) {
+  zoom = clamp(next, 0.45, 1.6);
+  document.documentElement.style.setProperty("--zoom", zoom);
+  document.documentElement.style.setProperty("--payload-font", `${12 * zoom}px`);
+  document.documentElement.style.setProperty("--detail-heading-font", `${14 * zoom}px`);
+  document.documentElement.style.setProperty("--detail-font", `${12 * zoom}px`);
+  document.documentElement.style.setProperty("--detail-label-font", `${11 * zoom}px`);
+  document.documentElement.style.setProperty("--detail-label-col", `${84 * zoom}px`);
+  document.documentElement.style.setProperty("--detail-gap-y", `${6 * zoom}px`);
+  document.documentElement.style.setProperty("--detail-gap-x", `${10 * zoom}px`);
+  document.documentElement.style.setProperty("--svg-label-font", `${12 * zoom}px`);
+  document.documentElement.style.setProperty("--svg-meta-font", `${11 * zoom}px`);
+  document.querySelector("#zoom-reset").textContent = `${Math.round(zoom * 100)}%`;
+  drawSvg();
+}
 function qs() {
   const p = new URLSearchParams();
   if (lastId) p.set("after_id", lastId);
@@ -280,8 +332,77 @@ function endpoint(trace, source) {
   if (trace.dir === "daemon_to_client") return source ? "daemon" : "acp-client";
   return trace.role ?? "daemon";
 }
+function truncate(text, max) {
+  if (!text) return "";
+  return text.length > max ? text.slice(0, max - 1) + "..." : text;
+}
+function shortMethod(method) {
+  return method ? method.replace(/^session\//, "") : "";
+}
+function textFrom(value) {
+  if (value == null) return "";
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  if (Array.isArray(value)) return value.map(textFrom).filter(Boolean).join(" ");
+  if (typeof value !== "object") return "";
+  for (const key of ["text", "message", "error"]) {
+    if (typeof value[key] === "string") return value[key];
+  }
+  for (const key of ["update", "content", "prompt", "result", "delta"]) {
+    const nested = textFrom(value[key]);
+    if (nested) return nested;
+  }
+  return "";
+}
+function summarizeTrace(trace) {
+  const payload = trace.payload ?? {};
+  let summary = "";
+  if (trace.method === "session/update") {
+    const update = payload.update ?? payload;
+    const kind = typeof update.sessionUpdate === "string" ? update.sessionUpdate.replace(/^agent_/, "") : "";
+    summary = textFrom(update.content) || textFrom(update);
+    return truncate([kind, summary].filter(Boolean).join(": "), 58);
+  }
+  if (trace.method === "session/prompt") {
+    summary = textFrom(payload.prompt) || textFrom(payload);
+    return truncate(summary ? `prompt: ${summary}` : "", 58);
+  }
+  summary = textFrom(payload);
+  return truncate(summary, 58);
+}
+function updatePayload(trace) {
+  const payload = trace.payload ?? {};
+  return payload.update ?? payload;
+}
+function isMessageChunk(trace) {
+  if (trace.method !== "session/update") return false;
+  const update = updatePayload(trace);
+  return typeof update.sessionUpdate === "string" && update.sessionUpdate.endsWith("message_chunk");
+}
+function messageChunkText(trace) {
+  if (!isMessageChunk(trace)) return "";
+  return textFrom(updatePayload(trace).content);
+}
+function promptText(trace) {
+  if (trace.method !== "session/prompt") return "";
+  const payload = trace.payload ?? {};
+  return textFrom(payload.prompt) || textFrom(payload);
+}
+function diagramLabel(trace) {
+  const chunk = messageChunkText(trace);
+  if (chunk) return `"${truncate(chunk, 56)}"`;
+  const prompt = promptText(trace);
+  if (prompt) return `"${truncate(prompt, 56)}"`;
+  const summary = summarizeTrace(trace);
+  const method = shortMethod(trace.method) || trace.kind;
+  return summary ? `${method} - ${summary}` : method;
+}
+function diagramLabelClass(trace) {
+  return messageChunkText(trace) || promptText(trace) ? "label quote-label" : "label";
+}
 function drawSvg() {
-  const height = Math.max(240, 70 + traces.length * 32);
+  const step = rowStep();
+  const height = Math.max(180, 52 + traces.length * step);
   diagram.setAttribute("viewBox", `0 0 760 ${height}`);
   diagram.textContent = "";
   const defs = document.createElementNS("http://www.w3.org/2000/svg", "defs");
@@ -304,21 +425,43 @@ function drawSvg() {
     diagram.appendChild(text);
   }
   for (const [index, trace] of traces.entries()) {
-    const y = 54 + index * 32;
+    const y = 42 + index * step;
     const color = colorFor(trace);
+    const group = document.createElementNS("http://www.w3.org/2000/svg", "g");
+    const isSelected = selectedTraceId === String(trace.id);
+    const isCorrelated = selectedRequestId && trace.request_id === selectedRequestId && !isSelected;
+    group.setAttribute("class", `trace-mark ${isSelected ? "selected" : ""} ${isCorrelated ? "correlated" : ""}`);
+    group.dataset.traceId = String(trace.id);
+    group.addEventListener("click", () => selectTrace(trace));
     if (trace.kind === "event" || trace.dir === "internal") {
       const x = lanes[endpoint(trace, true)] ?? lanes.daemon;
+      const hit = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+      hit.setAttribute("class", "trace-hit");
+      hit.setAttribute("cx", x);
+      hit.setAttribute("cy", y);
+      hit.setAttribute("r", 12 * zoom);
+      hit.setAttribute("stroke-width", 12 * zoom);
+      group.appendChild(hit);
       const dot = document.createElementNS("http://www.w3.org/2000/svg", "circle");
       dot.setAttribute("class", "event-dot");
       dot.setAttribute("cx", x);
       dot.setAttribute("cy", y);
-      dot.setAttribute("r", 5);
+      dot.setAttribute("r", 5 * zoom);
+      dot.setAttribute("stroke-width", 2 * zoom);
       dot.setAttribute("stroke", color);
-      diagram.appendChild(dot);
-      addSvgText(x + 10, y + 4, trace.method ?? "event", "label", "start");
+      group.appendChild(dot);
+      group.appendChild(svgText(x + 10, y + 4, diagramLabel(trace), diagramLabelClass(trace), "start"));
     } else {
       const x1 = lanes[endpoint(trace, true)] ?? lanes.daemon;
       const x2 = lanes[endpoint(trace, false)] ?? lanes.daemon;
+      const hit = document.createElementNS("http://www.w3.org/2000/svg", "line");
+      hit.setAttribute("class", "trace-hit");
+      hit.setAttribute("x1", x1);
+      hit.setAttribute("x2", x2);
+      hit.setAttribute("y1", y);
+      hit.setAttribute("y2", y);
+      hit.setAttribute("stroke-width", 12 * zoom);
+      group.appendChild(hit);
       const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
       line.setAttribute("class", "arrow");
       line.setAttribute("x1", x1);
@@ -326,67 +469,92 @@ function drawSvg() {
       line.setAttribute("y1", y);
       line.setAttribute("y2", y);
       line.setAttribute("stroke", color);
+      line.setAttribute("stroke-width", 2 * zoom);
       line.setAttribute("marker-end", "url(#arrowhead)");
-      diagram.appendChild(line);
-      addSvgText((x1 + x2) / 2, y - 6, trace.method ?? trace.kind, "label", "middle");
+      group.appendChild(line);
+      group.appendChild(svgText((x1 + x2) / 2, y - 6, diagramLabel(trace), diagramLabelClass(trace), "middle"));
     }
-    addSvgText(18, y + 4, String(trace.id), "meta", "start");
+    group.appendChild(svgText(18, y + 4, String(trace.id), "meta", "start"));
+    diagram.appendChild(group);
   }
 }
-function addSvgText(x, y, text, cls, anchor) {
+function svgText(x, y, text, cls, anchor) {
   const label = document.createElementNS("http://www.w3.org/2000/svg", "text");
   label.setAttribute("class", cls);
   label.setAttribute("x", x);
   label.setAttribute("y", y);
   label.setAttribute("text-anchor", anchor);
   label.textContent = text;
-  diagram.appendChild(label);
+  return label;
 }
-function correlate(row) {
-  document.querySelectorAll(".row.selected,.row.correlated").forEach(el => el.classList.remove("selected", "correlated"));
-  row.classList.add("selected");
-  const requestId = row.dataset.requestId;
-  if (!requestId) return;
-  document.querySelectorAll(`.row[data-request-id="${CSS.escape(requestId)}"]`).forEach(el => {
-    if (el !== row) el.classList.add("correlated");
-  });
+function showDetail(trace) {
+  const values = [
+    ["id", trace.id],
+    ["time", new Date(trace.ts).toLocaleString()],
+    ["session", trace.session_id ?? ""],
+    ["direction", trace.dir],
+    ["role", trace.role ?? ""],
+    ["kind", trace.kind],
+    ["method", trace.method ?? ""],
+    ["request", trace.request_id ?? ""],
+    ["summary", summarizeTrace(trace)],
+  ];
+  detailMeta.textContent = "";
+  for (const [label, value] of values) {
+    const k = document.createElement("div");
+    const v = document.createElement("div");
+    k.textContent = label;
+    v.textContent = value;
+    detailMeta.append(k, v);
+  }
+  detailPayload.textContent = JSON.stringify(trace.payload, null, 2);
+}
+function selectTrace(trace) {
+  selectedTraceId = String(trace.id);
+  selectedRequestId = trace.request_id ?? null;
+  showDetail(trace);
+  drawSvg();
 }
 function render(trace) {
   lastId = Math.max(lastId, trace.id);
   traces.push(trace);
-  const row = document.createElement("div");
-  row.className = "row " + trace.kind;
-  if (trace.request_id) row.dataset.requestId = trace.request_id;
-  const ts = new Date(trace.ts).toLocaleTimeString();
-  for (const value of [trace.id, ts, trace.dir, trace.role ?? "", trace.kind]) {
-    const cell = document.createElement("div");
-    cell.textContent = value;
-    row.appendChild(cell);
-  }
-  const detail = document.createElement("div");
-  const method = document.createElement("strong");
-  method.textContent = trace.method ?? "";
-  const payload = document.createElement("pre");
-  payload.textContent = JSON.stringify(trace.payload, null, 2);
-  detail.append(method, payload);
-  row.appendChild(detail);
-  row.onclick = () => {
-    row.classList.toggle("expanded");
-    correlate(row);
-  };
-  rows.appendChild(row);
-  drawSvg();
 }
 async function load(reset = false) {
-  if (reset) { lastId = 0; traces.length = 0; rows.textContent = ""; drawSvg(); }
+  if (reset) {
+    lastId = 0;
+    traces.length = 0;
+    selectedTraceId = null;
+    selectedRequestId = null;
+    detailMeta.textContent = "";
+    detailPayload.textContent = "Select a message in the graph to inspect the complete payload.";
+  }
   const r = await fetch("/api/traces?" + qs());
   const data = await r.json();
   data.traces.forEach(render);
+  if (reset || data.traces.length > 0) drawSvg();
 }
 document.querySelector("#refresh").onclick = () => load(true);
+document.querySelector("#compact").onchange = () => applyZoom(zoom);
+document.querySelector("#zoom-out").onclick = () => applyZoom(zoom - 0.1);
+document.querySelector("#zoom-reset").onclick = () => applyZoom(compactEnabled() ? 0.78 : 1);
+document.querySelector("#zoom-in").onclick = () => applyZoom(zoom + 0.1);
+window.addEventListener("keydown", event => {
+  if (!(event.metaKey || event.ctrlKey)) return;
+  if (event.key === "+" || event.key === "=") {
+    event.preventDefault();
+    applyZoom(zoom + 0.1);
+  } else if (event.key === "-") {
+    event.preventDefault();
+    applyZoom(zoom - 0.1);
+  } else if (event.key === "0") {
+    event.preventDefault();
+    applyZoom(compactEnabled() ? 0.78 : 1);
+  }
+});
 setInterval(() => {
   if (document.querySelector("#live").checked) load(false);
 }, 200);
+applyZoom(zoom);
 load(true);
 </script>
 </body>
