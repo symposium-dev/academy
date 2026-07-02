@@ -250,7 +250,7 @@ async fn load_live_session_replays_buffer() {
         ))
         .await;
 
-    assert_eq!(result, "agent_message_chunk:first: hello|second: world");
+    assert_eq!(result, "user_message_chunk:hello|second: world");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -296,7 +296,7 @@ async fn load_dead_session_respawns_agent_and_replays_history() {
 
     assert_eq!(
         result,
-        "agent_message_chunk:new: original prompt|new: follow up"
+        "user_message_chunk:original prompt|new: follow up"
     );
 }
 
@@ -357,7 +357,7 @@ async fn load_session_replays_history_after_daemon_restart() {
 
     assert_eq!(
         result,
-        "1|agent_message_chunk:reply: before restart|reply: after restart"
+        "1|user_message_chunk:before restart|reply: after restart"
     );
 
     second.abort();

@@ -3,15 +3,16 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use agent_client_protocol::schema::{
-    InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
-    LoadSessionRequest, LoadSessionResponse, McpServer, NewSessionRequest, NewSessionResponse,
-    ProtocolVersion, ResumeSessionRequest, ResumeSessionResponse, SessionConfigOptionCategory,
-    SessionId as AcpSessionId, SessionInfo, SetSessionConfigOptionRequest,
+    ContentChunk, InitializeRequest, InitializeResponse, ListSessionsRequest,
+    ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, McpServer, NewSessionRequest,
+    NewSessionResponse, PromptRequest, ProtocolVersion, ResumeSessionRequest,
+    ResumeSessionResponse, SessionConfigOptionCategory, SessionId as AcpSessionId, SessionInfo,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
 };
 use agent_client_protocol::util::MatchDispatch;
 use agent_client_protocol::{
     Agent, ByteStreams, Client, Dispatch, DynConnectTo, HandleDispatchFrom, Handled,
-    JsonRpcResponse, Responder,
+    JsonRpcMessage, JsonRpcResponse, Responder,
 };
 use chrono::Utc;
 use futures::StreamExt;
@@ -593,6 +594,14 @@ impl<'scope> Dispatcher<'scope> {
                 Ok(())
             })
             .await
+            .if_request(async |req: PromptRequest, responder| {
+                self.persist_user_message(client_id, &req).await;
+                let untyped = req.to_untyped_message().unwrap();
+                let dispatch = Dispatch::Request(untyped, responder.erase_to_json());
+                self.route_to_agent(client_id, dispatch).await;
+                Ok(())
+            })
+            .await
             .otherwise(async |dispatch| {
                 self.route_to_agent(client_id, dispatch).await;
                 Ok(())
@@ -616,6 +625,7 @@ impl<'scope> Dispatcher<'scope> {
             tracing::warn!(client_id, "dispatch but no agent");
             return;
         };
+
         self.trace_record_optional(self.trace_dispatch(
             Some(session_id.clone()),
             TraceDirection::DaemonToAgent,
@@ -624,6 +634,25 @@ impl<'scope> Dispatcher<'scope> {
         ))
         .await;
         let _ = agent.outgoing_tx.send(dispatch);
+    }
+
+    async fn persist_user_message(&self, client_id: ClientId, req: &PromptRequest) {
+        let Some(session_id) = self.client_to_session.get(&client_id) else {
+            return;
+        };
+        for block in &req.prompt {
+            let notif = SessionNotification::new(
+                AcpSessionId::new(session_id.clone()),
+                SessionUpdate::UserMessageChunk(ContentChunk::new(block.clone())),
+            );
+            if let Ok(msg) = agent_client_protocol::UntypedMessage::new("session/update", &notif)
+                && let Ok(value) = serde_json::to_value(&msg)
+            {
+                if let Err(e) = self.store.append_message(session_id, &value).await {
+                    tracing::error!(session_id, error = %e, "failed to persist user message");
+                }
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
