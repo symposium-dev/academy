@@ -22,6 +22,7 @@ pub struct Daemon {
     send_guidelines: bool,
     default_model: Option<String>,
     trace: bool,
+    serve_jamsession_tool: bool,
     lifecycle_tx: Option<LifecycleEventSender>,
     shutdown_token: Option<CancellationToken>,
 }
@@ -38,6 +39,7 @@ impl Daemon {
             send_guidelines: true,
             default_model: None,
             trace: false,
+            serve_jamsession_tool: true,
             lifecycle_tx: None,
             shutdown_token: None,
         }
@@ -54,6 +56,7 @@ impl Daemon {
             send_guidelines: true,
             default_model: None,
             trace: false,
+            serve_jamsession_tool: true,
             lifecycle_tx: None,
             shutdown_token: None,
         }
@@ -86,6 +89,15 @@ impl Daemon {
 
     pub fn with_trace(mut self, trace: bool) -> Self {
         self.trace = trace;
+        self
+    }
+
+    /// Whether the daemon serves the `jamsession` MCP tool to agents.
+    ///
+    /// Defaults to `true`. Tests that assert exact message flow can disable it
+    /// to keep the agent transport unwrapped.
+    pub fn with_serve_jamsession_tool(mut self, serve: bool) -> Self {
+        self.serve_jamsession_tool = serve;
         self
     }
 
@@ -204,6 +216,7 @@ impl Daemon {
                     self.lifecycle_tx.clone(),
                     dispatcher_tx,
                     self.trace,
+                    self.serve_jamsession_tool,
                 )
                 .await?;
 

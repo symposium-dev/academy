@@ -99,6 +99,44 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-client-protocol-polyfill"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "21f6745a457d71d87f60e781e0f5cac7b4674c7f7dc71c3aa8b613fb7ca17bfb"
+dependencies = [
+ "agent-client-protocol",
+ "anyhow",
+ "async-stream",
+ "axum",
+ "futures",
+ "futures-concurrency",
+ "rustc-hash",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "agent-client-protocol-rmcp"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "acfd162bb1d3d3f6d42cdabfaf7cfb471fda25d423591dee9ac1e374ab034970"
+dependencies = [
+ "agent-client-protocol",
+ "futures",
+ "futures-concurrency",
+ "rmcp 1.8.0",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "agent-client-protocol-schema"
 version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -297,6 +335,28 @@ dependencies = [
  "signal-hook-registry",
  "slab",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "async-stream"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b5a71a6f37880a80d1d7f19efd781e4b5de42c88f0722cc13bcb6cc2cfe8476"
+dependencies = [
+ "async-stream-impl",
+ "futures-core",
+ "pin-project-lite",
+]
+
+[[package]]
+name = "async-stream-impl"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7c24de15d275a1ecfd47a380fb4d5ec9bfe0933f309ed5e705b775596a3574d"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
@@ -1698,6 +1758,9 @@ version = "0.1.0"
 dependencies = [
  "acpr",
  "agent-client-protocol",
+ "agent-client-protocol-conductor",
+ "agent-client-protocol-polyfill",
+ "agent-client-protocol-rmcp",
  "chrono",
  "clap",
  "dirs",
@@ -1707,6 +1770,7 @@ dependencies = [
  "libc",
  "pkg-config",
  "rust-embed",
+ "schemars 1.2.1",
  "scope-tasks",
  "serde",
  "serde_json",
@@ -2554,7 +2618,7 @@ dependencies = [
  "anyhow",
  "clap",
  "rhai",
- "rmcp",
+ "rmcp 0.12.0",
  "serde_json",
  "tokio",
  "tracing",
@@ -2591,7 +2655,7 @@ dependencies = [
  "pin-project-lite",
  "process-wrap",
  "reqwest 0.12.28",
- "rmcp-macros",
+ "rmcp-macros 0.12.0",
  "schemars 1.2.1",
  "serde",
  "serde_json",
@@ -2604,10 +2668,45 @@ dependencies = [
 ]
 
 [[package]]
+name = "rmcp"
+version = "1.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d1f571c72940a19d9532fe52dbea8bc9912bf1d766c2970bb824056b86f3f59"
+dependencies = [
+ "async-trait",
+ "base64",
+ "chrono",
+ "futures",
+ "pastey",
+ "pin-project-lite",
+ "rmcp-macros 1.8.0",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "rmcp-macros"
 version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3f81daaa494eb8e985c9462f7d6ce1ab05e5299f48aafd76cdd3d8b060e6f59"
+dependencies = [
+ "darling",
+ "proc-macro2",
+ "quote",
+ "serde_json",
+ "syn",
+]
+
+[[package]]
+name = "rmcp-macros"
+version = "1.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1aad0035b69380782d78ea95b508327e6deaa2235909053e596eea8f27b5e1d5"
 dependencies = [
  "darling",
  "proc-macro2",

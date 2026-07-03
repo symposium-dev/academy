@@ -6,3 +6,7 @@
 //! enum and its dispatch.
 
 pub mod command;
+pub mod tool;
+
+pub use command::dispatch_json;
+pub use tool::{JamsessionTool, JamsessionToolCall, ToolCallSender};

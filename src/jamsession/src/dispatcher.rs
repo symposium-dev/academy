@@ -24,6 +24,7 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::agent::AgentFactory;
 use crate::db::{NewTrace, SessionRecord, Store, TraceDirection, TraceKind};
+use crate::jamsession_tool::{self, JamsessionTool, JamsessionToolCall, ToolCallSender};
 use crate::session::{LifecycleEvent, LifecycleEventSender};
 
 // ---------------------------------------------------------------------------
@@ -96,6 +97,9 @@ pub(super) enum DispatcherMessage {
         from: String,
         to: String,
     },
+
+    // --- jamsession tool ---
+    JamsessionToolCall(JamsessionToolCall),
 }
 // ANCHOR_END: daemon-message
 
@@ -184,6 +188,13 @@ pub(super) struct Dispatcher<'scope> {
     event_tx: Option<LifecycleEventSender>,
     dispatcher_tx: mpsc::UnboundedSender<DispatcherMessage>,
     trace: bool,
+    /// Whether to serve the `jamsession` MCP tool to agents. When enabled, new
+    /// sessions are wrapped in a conductor chain that serves the tool over
+    /// MCP-over-ACP. See [`crate::jamsession_tool`].
+    serve_jamsession_tool: bool,
+    /// Sender that agent-side tool instances use to forward tool calls into the
+    /// dispatcher loop (via a forwarder task spawned in [`Dispatcher::new`]).
+    tool_calls: ToolCallSender,
     next_agent_id: u64,
 }
 
@@ -200,7 +211,27 @@ impl<'scope> Dispatcher<'scope> {
         event_tx: Option<LifecycleEventSender>,
         dispatcher_tx: mpsc::UnboundedSender<DispatcherMessage>,
         trace: bool,
+        serve_jamsession_tool: bool,
     ) -> crate::error::Result<Self> {
+        // Tool instances live on agent connections and cannot name
+        // `DispatcherMessage` (it is private). They send `JamsessionToolCall`s
+        // over this channel; a forwarder task wraps each one into a
+        // `DispatcherMessage` so it is handled on the central loop.
+        let (tool_calls, mut tool_calls_rx) = mpsc::unbounded_channel::<JamsessionToolCall>();
+        {
+            let dispatcher_tx = dispatcher_tx.clone();
+            tokio::spawn(async move {
+                while let Some(call) = tool_calls_rx.recv().await {
+                    if dispatcher_tx
+                        .send(DispatcherMessage::JamsessionToolCall(call))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+        }
+
         let mut dispatcher = Self {
             tasks,
             clients: HashMap::new(),
@@ -218,6 +249,8 @@ impl<'scope> Dispatcher<'scope> {
             event_tx,
             dispatcher_tx,
             trace,
+            serve_jamsession_tool,
+            tool_calls,
             next_agent_id: 1,
         };
         dispatcher.rehydrate_from_store().await?;
@@ -347,7 +380,36 @@ impl<'scope> Dispatcher<'scope> {
                 )
                 .await;
             }
+            DispatcherMessage::JamsessionToolCall(call) => {
+                self.handle_tool_call(call).await;
+            }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // jamsession tool
+    // -----------------------------------------------------------------------
+
+    /// Handle a `jamsession` tool invocation from an agent.
+    ///
+    /// The command logic lives in [`jamsession_tool`]; the dispatcher's job is
+    /// to run it against daemon state and return the JSON response. Team state
+    /// is threaded in by a later step — for now every call is dispatched
+    /// statelessly.
+    async fn handle_tool_call(&mut self, call: JamsessionToolCall) {
+        let JamsessionToolCall {
+            agent_id,
+            input,
+            respond,
+        } = call;
+
+        let session_id = self.agent_to_session.get(&agent_id).cloned();
+        self.trace_event(session_id, "agent", "jamsession_tool_call", input.clone())
+            .await;
+
+        let response = jamsession_tool::dispatch_json(input);
+        // The agent may have gone away before we could answer; that is benign.
+        let _ = respond.send(response);
     }
 
     // -----------------------------------------------------------------------
@@ -781,6 +843,7 @@ impl<'scope> Dispatcher<'scope> {
                 return;
             }
         };
+        let transport = self.wrap_transport_with_tool(agent_id, transport);
 
         let _ = self.tasks.spawn(async move {
             agent_pipe(
@@ -1238,6 +1301,54 @@ impl<'scope> Dispatcher<'scope> {
         }
 
         Ok(())
+    }
+
+    /// Wrap an agent transport so the daemon serves the `jamsession` MCP tool
+    /// to it over MCP-over-ACP.
+    ///
+    /// When [`serve_jamsession_tool`](Self::serve_jamsession_tool) is disabled,
+    /// the transport is returned unchanged. Otherwise the agent is placed at the
+    /// end of a conductor chain fronted by two proxies: one that serves the
+    /// `jamsession` tool (bound to `agent_id`) and one that polyfills
+    /// MCP-over-ACP for agents lacking native support. Nested conductors
+    /// compose, so `inner` speaking ACP is all that is required of it.
+    ///
+    /// Note: only the `New` session path is wrapped today; see the
+    /// new-session-only limitation documented in the RFD.
+    fn wrap_transport_with_tool(
+        &self,
+        agent_id: AgentId,
+        inner: DynConnectTo<Client>,
+    ) -> DynConnectTo<Client> {
+        use agent_client_protocol::{Conductor, Proxy};
+        use agent_client_protocol_conductor::{ConductorImpl, ProxiesAndAgent};
+        use agent_client_protocol_polyfill::mcp_over_acp::McpOverAcpPolyfill;
+        use agent_client_protocol_rmcp::McpServerExt;
+
+        if !self.serve_jamsession_tool {
+            return inner;
+        }
+
+        let tool = JamsessionTool::new(agent_id, self.tool_calls.clone());
+        let mcp_server = agent_client_protocol::mcp_server::McpServer::<Conductor>::builder(
+            JamsessionTool::NAME,
+        )
+        .tool(tool)
+        .build();
+
+        let tool_proxy = Proxy
+            .builder()
+            .name("jamsession-tool")
+            .with_mcp_server(mcp_server);
+
+        let conductor = ConductorImpl::new_agent(
+            "jamsession-daemon-tool",
+            ProxiesAndAgent::new(inner)
+                .proxy(tool_proxy)
+                .proxy(McpOverAcpPolyfill::http()),
+        );
+
+        DynConnectTo::new(conductor)
     }
 
     fn generate_agent_id(&mut self) -> AgentId {
