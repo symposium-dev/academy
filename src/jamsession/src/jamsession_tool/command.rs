@@ -286,10 +286,15 @@ pub fn dispatch_json(input: Value, ctx: &TeamContext) -> Value {
 
 /// Dispatch a parsed command against the caller's team context.
 ///
-/// `help` is always available. Team commands require membership (`ctx.team`);
-/// `list-members` is answered from the context. The remaining team commands are
-/// implemented in later steps and, until then, report that they are unimplemented
-/// once membership is established.
+/// This is the *pure* command core: `help` (always available) and
+/// `list-members` (answered from the context) are fully handled here, and every
+/// team command reports not-a-member when the caller has no team.
+///
+/// The side-effecting team commands (messaging, worklist, store) are handled by
+/// the dispatcher, which intercepts them for on-team callers before they reach
+/// this function (see `effectful_command` in the dispatcher). Reaching the
+/// effectful arm below with a team therefore means the caller bypassed that
+/// seam; we return a defensive error rather than silently succeeding.
 fn dispatch(cmd: JamsessionCommand, ctx: &TeamContext) -> Value {
     match cmd {
         JamsessionCommand::Help { subcommand } => help(subcommand.as_deref()),
@@ -302,7 +307,8 @@ fn dispatch(cmd: JamsessionCommand, ctx: &TeamContext) -> Value {
             json!({ "members": ctx.members })
         }
 
-        // Membership-gated commands whose behavior lands in later steps.
+        // Effectful team commands: gated on membership here, but their behavior
+        // lives in the dispatcher (see the doc comment above).
         JamsessionCommand::Broadcast { .. }
         | JamsessionCommand::Send { .. }
         | JamsessionCommand::PostWorklist { .. }
@@ -313,7 +319,7 @@ fn dispatch(cmd: JamsessionCommand, ctx: &TeamContext) -> Value {
             if ctx.team.is_none() {
                 not_a_team_member_error()
             } else {
-                not_yet_implemented_error()
+                dispatcher_only_error()
             }
         }
     }
@@ -407,11 +413,12 @@ fn not_a_team_member_error() -> Value {
     })
 }
 
-/// Error returned for a team command that is recognized and permitted (the
-/// caller is on a team) but whose behavior is not yet implemented.
-fn not_yet_implemented_error() -> Value {
+/// Error returned when an effectful team command reaches the pure core with a
+/// team set. This should not happen: the dispatcher intercepts these commands
+/// for on-team callers. It indicates the dispatcher's routing seam was bypassed.
+fn dispatcher_only_error() -> Value {
     json!({
-        "error": "command not yet implemented",
+        "error": "command must be handled by the daemon dispatcher",
     })
 }
 
@@ -604,19 +611,21 @@ mod tests {
     }
 
     #[test]
-    fn other_team_commands_are_gated_then_unimplemented() {
-        // Without a team: not-a-member.
+    fn effectful_command_gating_in_pure_core() {
+        // Without a team: not-a-member (the pure core owns this response).
         let r = dispatch_json(json!({"command": "broadcast", "message": "x"}), &no_team());
         assert_eq!(
             r.get("error").and_then(Value::as_str),
             Some("not a team member")
         );
-        // On a team: recognized but not yet implemented (lands in later steps).
+        // On a team, the pure core does NOT execute effectful commands — the
+        // dispatcher intercepts them. Reaching the core here is a bypass and
+        // yields a defensive error. (At runtime the dispatcher handles these.)
         let ctx = on_team("frontend", &[("agent-1", "active")]);
         let r = dispatch_json(json!({"command": "broadcast", "message": "x"}), &ctx);
         assert_eq!(
             r.get("error").and_then(Value::as_str),
-            Some("command not yet implemented")
+            Some("command must be handled by the daemon dispatcher")
         );
     }
 }
