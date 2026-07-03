@@ -43,6 +43,25 @@ Nested conductors compose: acpr runs its own inner conductor in front of
 polyfill rewrites the daemon's `acp:` URL into a localhost bridge and tunnels
 `_mcp/*` back over ACP.
 
+> **Known limitation — MCP-over-ACP is new-session-only (upstream).** In the
+> current SDK and polyfill, MCP servers are attached exclusively through
+> `NewSessionRequest`: the SDK's `McpNewSessionHandler` matches only
+> `NewSessionRequest`, `into_handler_and_responder` is `pub(crate)` (so
+> `SessionBuilder::with_mcp_server` is the only public attach path), and the
+> polyfill rewrites `acp:` URLs only on `NewSessionRequest` — never on
+> `ResumeSessionRequest`/`LoadSessionRequest`, despite both carrying an
+> `mcp_servers` field. **Consequence for the daemon:** an agent respawned after
+> idle-kill comes back via `session/resume` *without* the `jamsession` tool. New
+> sessions are fine; resumed ones lose the tool until the next new session. This
+> directly affects Step 6 (a queued team-message wakes a dead agent, but the
+> respawned agent cannot `send`/`broadcast` back). The daemon-side rework of
+> mcp-over-acp is tracked separately; what the daemon needs from it: (1) an
+> MCP-serve path that survives respawn (available on resume/load, or a host
+> re-attach contract on every session-start variant); (2) per-agent handler
+> identity so the tool closure can keep capturing `agent_id`; (3) ideally native
+> `mcpCapabilities.acp` so production needs no localhost-bridge polyfill hop. Until
+> then, Step 2 wires the tool through the current new-session-only polyfill.
+
 The integration-test harness mirrors this: the test `RhaiAgentFactory` wraps the
 `RhaiAgent` the same way, so a Rhai script can call
 `mcp::call_tool("jamsession", "jamsession", #{ command: "help" })`. This is the
@@ -80,14 +99,19 @@ static command table matching the RFD.
 
 ## Step 2: MCP transport wiring (first, riskiest integration)
 
-Attach the `jamsession` MCP server in `agent_pipe` for both `New` and `Resume`
-sessions. The tool forwards raw JSON to a new
-`DispatcherMessage::JamsessionCommand { agent_id, input, respond }`; the
+Attach the `jamsession` MCP server in `agent_pipe`. The tool forwards raw JSON
+to a new `DispatcherMessage::JamsessionCommand { agent_id, input, respond }`; the
 dispatcher calls Step 1's `dispatch` (no team state yet) and replies over the
 oneshot. Wrap the test `RhaiAgent` in conductor + `McpOverAcpPolyfill::http()`
 (behind a flag so existing tests are undisturbed); add
 `agent-client-protocol-conductor`, `-polyfill`, and `-rmcp` to `jamsession-test`
 dev-deps.
+
+Per the **Known limitation** above, the tool can only be attached on the
+`New` session path today (`SessionBuilder::with_mcp_server` mutates a
+`NewSessionRequest`, and the polyfill bridges `acp:` URLs only there). Step 2
+therefore wires the `New` path; resumed/respawned agents will regain the tool
+once the mcp-over-acp rework lands.
 
 **Red (integration):**
 
