@@ -422,10 +422,9 @@ impl<'scope> Dispatcher<'scope> {
 
     /// Handle a `jamsession` tool invocation from an agent.
     ///
-    /// The command logic lives in [`jamsession_tool`]; the dispatcher's job is
-    /// to run it against daemon state and return the JSON response. Team state
-    /// is threaded in by a later step — for now every call is dispatched
-    /// statelessly.
+    /// The command logic lives in [`jamsession_tool`]; the dispatcher resolves
+    /// the calling agent's team context from daemon state, runs the command
+    /// against it, and returns the JSON response.
     async fn handle_tool_call(&mut self, call: JamsessionToolCall) {
         let JamsessionToolCall {
             agent_id,
@@ -434,12 +433,74 @@ impl<'scope> Dispatcher<'scope> {
         } = call;
 
         let session_id = self.agent_to_session.get(&agent_id).cloned();
-        self.trace_event(session_id, "agent", "jamsession_tool_call", input.clone())
-            .await;
+        self.trace_event(
+            session_id.clone(),
+            "agent",
+            "jamsession_tool_call",
+            input.clone(),
+        )
+        .await;
 
-        let response = jamsession_tool::dispatch_json(input);
+        let ctx = self.team_context_for(session_id.as_deref()).await;
+        let response = jamsession_tool::dispatch_json(input, &ctx);
         // The agent may have gone away before we could answer; that is benign.
         let _ = respond.send(response);
+    }
+
+    /// Resolve the [`TeamContext`] for the agent owning `session_id`.
+    ///
+    /// Returns a team-less context if the session is unknown or not on a team.
+    /// A member's status is `active` when a live agent currently backs its
+    /// session, else `idle`.
+    async fn team_context_for(&self, session_id: Option<&str>) -> jamsession_tool::TeamContext {
+        use jamsession_tool::{MemberInfo, TeamContext};
+
+        let Some(session_id) = session_id else {
+            return TeamContext::default();
+        };
+        let team = match self.store.team_of_session(session_id).await {
+            Ok(team) => team,
+            Err(e) => {
+                tracing::error!(session_id, error = %e, "failed to read team membership");
+                None
+            }
+        };
+        let Some(team) = team else {
+            return TeamContext::none(session_id);
+        };
+
+        let member_ids = self.store.team_members(&team).await.unwrap_or_default();
+        let mut members = Vec::with_capacity(member_ids.len());
+        for id in member_ids {
+            let working_dir = self
+                .sessions
+                .get(&id)
+                .map(|s| s.record.cwd.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let status = if self.session_has_live_agent(&id) {
+                "active"
+            } else {
+                "idle"
+            };
+            members.push(MemberInfo {
+                id,
+                working_dir,
+                status: status.to_string(),
+            });
+        }
+
+        TeamContext {
+            team: Some(team),
+            me: session_id.to_string(),
+            members,
+        }
+    }
+
+    /// Whether `session_id` currently has a live agent backing it.
+    fn session_has_live_agent(&self, session_id: &str) -> bool {
+        self.sessions.get(session_id).is_some_and(|s| {
+            s.lifecycle_state != LifecycleState::AgentDead && self.agents.contains_key(&s.agent_id)
+        })
     }
 
     // -----------------------------------------------------------------------

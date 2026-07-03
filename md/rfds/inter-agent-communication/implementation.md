@@ -187,10 +187,19 @@ Tracked as a follow-up.
 `dispatch` now consults membership (agent_id → session → team). Implement
 `list-members`, returning each member's id, working_dir, and status.
 
-**Red (integration):**
+**Status: done.** `dispatch_json` takes a `TeamContext { team, me, members }`
+(plain data), keeping `command.rs` free of storage concerns. The dispatcher's
+`team_context_for` resolves it from the Store (team, roster) and in-memory
+session state (working_dir from the session record; `active` when a live agent
+backs the session, else `idle`). `list-members` returns the roster; the other
+team commands are membership-gated and report `command not yet implemented`
+until their steps land.
 
-- [ ] after join, `list-members` returns the roster
-- [ ] before join, `list-members` still returns not-a-member
+**Red:**
+
+- [x] `list-members` returns the roster (unit) and, end-to-end, the joining
+      session sees itself as an active member (integration)
+- [x] before join, `list-members` returns not-a-member
 
 ## Step 6: Messaging (`send` + `broadcast`)
 

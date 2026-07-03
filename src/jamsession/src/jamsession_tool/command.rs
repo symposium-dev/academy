@@ -5,12 +5,53 @@
 //! [`serde_json::Value`] response. The transport layer (see the dispatcher)
 //! is responsible only for shuttling those JSON values to and from the agent.
 //!
-//! At this stage only [`help`](JamsessionCommand::Help) is implemented; every
-//! team command reports that the agent is not yet a team member. Later steps
-//! thread team state through [`dispatch`] and light those commands up.
+//! Command dispatch is parameterized by a [`TeamContext`] describing the calling
+//! agent's team membership. `help` is always available; team commands are
+//! answered against the context or report that the agent is not on a team.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+
+// ---------------------------------------------------------------------------
+// Team context
+// ---------------------------------------------------------------------------
+
+/// One member of a team, as reported by `list-members`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MemberInfo {
+    /// The member's agent id (currently the session id).
+    pub id: String,
+    /// The member's working directory.
+    pub working_dir: String,
+    /// The member's status: `active` if an agent is currently live, else `idle`.
+    pub status: String,
+}
+
+/// The team context for a single tool invocation: which team the calling agent
+/// is on (if any) and the current roster.
+///
+/// The dispatcher resolves this from daemon state before dispatching; keeping it
+/// as plain data leaves command logic free of transport and storage concerns.
+#[derive(Debug, Clone, Default)]
+pub struct TeamContext {
+    /// The team the caller belongs to, or `None` if not on a team.
+    pub team: Option<String>,
+    /// The caller's own id (session id), for self-identification in listings.
+    pub me: String,
+    /// The full member roster of the caller's team (empty if not on a team).
+    pub members: Vec<MemberInfo>,
+}
+
+impl TeamContext {
+    /// A context for an agent that is not on any team.
+    pub fn none(me: impl Into<String>) -> Self {
+        Self {
+            team: None,
+            me: me.into(),
+            members: Vec::new(),
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Command enum
@@ -215,11 +256,12 @@ const COMMANDS: &[CommandSpec] = &[
 // Dispatch
 // ---------------------------------------------------------------------------
 
-/// Parse a raw tool input value and dispatch it, returning a JSON response.
+/// Parse a raw tool input value and dispatch it against `ctx`, returning a JSON
+/// response.
 ///
 /// Unknown commands and malformed input produce a structured error object with
 /// a `hint` pointing at `help`, rather than surfacing a serde error.
-pub fn dispatch_json(input: Value) -> Value {
+pub fn dispatch_json(input: Value, ctx: &TeamContext) -> Value {
     let Some(command) = input
         .get("command")
         .and_then(Value::as_str)
@@ -233,7 +275,7 @@ pub fn dispatch_json(input: Value) -> Value {
     }
 
     match serde_json::from_value::<JamsessionCommand>(input) {
-        Ok(cmd) => dispatch(cmd),
+        Ok(cmd) => dispatch(cmd, ctx),
         Err(err) => json!({
             "error": format!("invalid arguments for command: {command}"),
             "detail": err.to_string(),
@@ -242,21 +284,38 @@ pub fn dispatch_json(input: Value) -> Value {
     }
 }
 
-/// Dispatch a parsed command.
+/// Dispatch a parsed command against the caller's team context.
 ///
-/// At this stage only `help` is live. All team commands require membership,
-/// which does not exist yet, so they report that uniformly.
-fn dispatch(cmd: JamsessionCommand) -> Value {
+/// `help` is always available. Team commands require membership (`ctx.team`);
+/// `list-members` is answered from the context. The remaining team commands are
+/// implemented in later steps and, until then, report that they are unimplemented
+/// once membership is established.
+fn dispatch(cmd: JamsessionCommand, ctx: &TeamContext) -> Value {
     match cmd {
         JamsessionCommand::Help { subcommand } => help(subcommand.as_deref()),
-        JamsessionCommand::ListMembers
-        | JamsessionCommand::Broadcast { .. }
+
+        // Requires membership; answered from the context.
+        JamsessionCommand::ListMembers => {
+            if ctx.team.is_none() {
+                return not_a_team_member_error();
+            }
+            json!({ "members": ctx.members })
+        }
+
+        // Membership-gated commands whose behavior lands in later steps.
+        JamsessionCommand::Broadcast { .. }
         | JamsessionCommand::Send { .. }
         | JamsessionCommand::PostWorklist { .. }
         | JamsessionCommand::RemoveWorklist { .. }
         | JamsessionCommand::ShowWorklist
         | JamsessionCommand::Store { .. }
-        | JamsessionCommand::Retrieve { .. } => not_a_team_member_error(),
+        | JamsessionCommand::Retrieve { .. } => {
+            if ctx.team.is_none() {
+                not_a_team_member_error()
+            } else {
+                not_yet_implemented_error()
+            }
+        }
     }
 }
 
@@ -348,14 +407,43 @@ fn not_a_team_member_error() -> Value {
     })
 }
 
+/// Error returned for a team command that is recognized and permitted (the
+/// caller is on a team) but whose behavior is not yet implemented.
+fn not_yet_implemented_error() -> Value {
+    json!({
+        "error": "command not yet implemented",
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use expect_test::expect;
 
+    /// A context for an agent that is not on a team.
+    fn no_team() -> TeamContext {
+        TeamContext::none("agent-1")
+    }
+
+    /// A context for an agent on `team` with the given members.
+    fn on_team(team: &str, members: &[(&str, &str)]) -> TeamContext {
+        TeamContext {
+            team: Some(team.to_string()),
+            me: "agent-1".to_string(),
+            members: members
+                .iter()
+                .map(|(id, status)| MemberInfo {
+                    id: id.to_string(),
+                    working_dir: format!("/work/{id}"),
+                    status: status.to_string(),
+                })
+                .collect(),
+        }
+    }
+
     #[test]
     fn general_help_lists_every_command() {
-        let response = dispatch_json(json!({"command": "help"}));
+        let response = dispatch_json(json!({"command": "help"}), &no_team());
         let text = response.as_str().expect("help returns a string");
 
         // Every command name appears in the table.
@@ -395,7 +483,7 @@ mod tests {
 
     #[test]
     fn help_send_returns_detail() {
-        let response = dispatch_json(json!({"command": "help", "subcommand": "send"}));
+        let response = dispatch_json(json!({"command": "help", "subcommand": "send"}), &no_team());
         let text = response.as_str().expect("help detail returns a string");
 
         expect![[r#"
@@ -417,7 +505,7 @@ mod tests {
 
     #[test]
     fn unknown_command_returns_error_and_hint() {
-        let response = dispatch_json(json!({"command": "frobnicate"}));
+        let response = dispatch_json(json!({"command": "frobnicate"}), &no_team());
         expect![[r#"
             {
               "error": "unknown command: frobnicate",
@@ -428,7 +516,10 @@ mod tests {
 
     #[test]
     fn help_unknown_subcommand_returns_error() {
-        let response = dispatch_json(json!({"command": "help", "subcommand": "frobnicate"}));
+        let response = dispatch_json(
+            json!({"command": "help", "subcommand": "frobnicate"}),
+            &no_team(),
+        );
         assert_eq!(
             response.get("error").and_then(Value::as_str),
             Some("unknown command: frobnicate")
@@ -437,7 +528,10 @@ mod tests {
 
     #[test]
     fn team_command_without_membership_reports_not_a_member() {
-        let response = dispatch_json(json!({"command": "send", "to": "agent-2", "message": "hi"}));
+        let response = dispatch_json(
+            json!({"command": "send", "to": "agent-2", "message": "hi"}),
+            &no_team(),
+        );
         expect![[r#"
             {
               "error": "not a team member",
@@ -458,7 +552,7 @@ mod tests {
             json!({"command": "store", "key": "k", "value": 1}),
             json!({"command": "retrieve", "key": "k"}),
         ] {
-            let response = dispatch_json(input.clone());
+            let response = dispatch_json(input.clone(), &no_team());
             assert_eq!(
                 response.get("error").and_then(Value::as_str),
                 Some("not a team member"),
@@ -470,11 +564,59 @@ mod tests {
     #[test]
     fn malformed_known_command_reports_invalid_arguments() {
         // `send` requires `to` and `message`.
-        let response = dispatch_json(json!({"command": "send", "to": "agent-2"}));
+        let response = dispatch_json(json!({"command": "send", "to": "agent-2"}), &no_team());
         assert_eq!(
             response.get("error").and_then(Value::as_str),
             Some("invalid arguments for command: send")
         );
         assert!(response.get("hint").is_some());
+    }
+
+    #[test]
+    fn list_members_without_team_reports_not_a_member() {
+        let response = dispatch_json(json!({"command": "list-members"}), &no_team());
+        assert_eq!(
+            response.get("error").and_then(Value::as_str),
+            Some("not a team member")
+        );
+    }
+
+    #[test]
+    fn list_members_returns_roster_when_on_team() {
+        let ctx = on_team("frontend", &[("agent-1", "active"), ("agent-2", "idle")]);
+        let response = dispatch_json(json!({"command": "list-members"}), &ctx);
+        expect![[r#"
+            {
+              "members": [
+                {
+                  "id": "agent-1",
+                  "status": "active",
+                  "working_dir": "/work/agent-1"
+                },
+                {
+                  "id": "agent-2",
+                  "status": "idle",
+                  "working_dir": "/work/agent-2"
+                }
+              ]
+            }"#]]
+        .assert_eq(&serde_json::to_string_pretty(&response).unwrap());
+    }
+
+    #[test]
+    fn other_team_commands_are_gated_then_unimplemented() {
+        // Without a team: not-a-member.
+        let r = dispatch_json(json!({"command": "broadcast", "message": "x"}), &no_team());
+        assert_eq!(
+            r.get("error").and_then(Value::as_str),
+            Some("not a team member")
+        );
+        // On a team: recognized but not yet implemented (lands in later steps).
+        let ctx = on_team("frontend", &[("agent-1", "active")]);
+        let r = dispatch_json(json!({"command": "broadcast", "message": "x"}), &ctx);
+        assert_eq!(
+            r.get("error").and_then(Value::as_str),
+            Some("command not yet implemented")
+        );
     }
 }
