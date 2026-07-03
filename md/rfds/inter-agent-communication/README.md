@@ -2,7 +2,7 @@
 
 ## TL;DR
 
-- Adds team-based communication commands to the [`jamsession` tool](../jamsession-tool/README.md).
+- Adds team-based communication commands to the [`jamsession` tool](./jamsession-tool/README.md).
 - Team membership is controlled by the human via slash commands (`/jamsession:join-team`), not by the agent.
 - Commands: `list-members`, `broadcast`, `send`, `post-worklist`, `remove-worklist`, `show-worklist`, `store`, `retrieve`.
 
@@ -12,7 +12,7 @@ Agents working on related tasks (e.g., frontend + backend of the same feature) n
 
 ## Change in a nutshell
 
-Building on the [`jamsession` tool RFD](../jamsession-tool/README.md), this RFD adds commands for team-based inter-agent communication. The `jamsession` tool's static description already lists these commands. When invoked before team membership is established, they return an error directing the user to `/jamsession:join-team`.
+Building on the [`jamsession` tool RFD](./jamsession-tool/README.md) — a sub-RFD of this one, since the tool is the requisite delivery vehicle — this RFD adds commands for team-based inter-agent communication. The `jamsession` tool's static description already lists these commands. When invoked before team membership is established, they return an error directing the user to `/jamsession:join-team`.
 
 Example once on a team:
 

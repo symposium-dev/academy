@@ -1,27 +1,167 @@
 # Implementation plan and status
 
-### Step 1: Team data model and slash commands
+This plan covers both this RFD and its sub-RFD, the
+[`jamsession` tool](./jamsession-tool/README.md). The tool is the delivery
+vehicle for every team command, so the two are implemented together.
 
-Add team state to the daemon's persistent state. Implement `/jamsession:join-team`, `/jamsession:leave-team`, `/jamsession:teams` slash commands. Implement context injection on join.
+The steps are ordered for **red-green TDD**: each introduces one concept, is
+driven by a failing test first, and leaves the tree building. Behavior is kept
+separate from transport wherever possible so most logic is unit-testable without
+any ACP/MCP plumbing.
 
-- [ ] TBD
+## Background: how the tool reaches the agent
 
-### Step 2: `list-members`
+The daemon is the ACP *client* toward each agent. It offers the `jamsession`
+tool as an **MCP-over-ACP** server attached to the session:
 
-Add the `ListMembers` variant and handler.
+- Build the server with
+  `agent_client_protocol_rmcp::McpServerExt::builder("jamsession")`, register one
+  tool, and `build()`.
+- `McpServer::into_handler_and_responder()` →
+  `handler.into_dynamic_handler(&mut new_session_request, &cx)?` mutates the
+  outgoing `NewSessionRequest` to push an `McpServer::Http { url: "acp:<uuid>" }`
+  entry and registers a dynamic handler that answers the agent's `_mcp/*`
+  traffic. Keep the registration alive with `.run_indefinitely()`.
+- The tool's `call_tool` closure captures the `agent_id` and a `DispatcherMessage`
+  sender at construction (the `McpConnectionTo` context does **not** carry our
+  session id), so each tool call can be routed back to the right session's team.
 
-- [ ] TBD
+Because `claude-acp` does not support `mcpCapabilities.acp`, the daemon must run
+the target agent behind **its own conductor** that includes the MCP-over-ACP
+polyfill, rather than relying on acpr's built-in `AgentOnly` conductor. The
+factory wraps whatever agent it produces (a `DynConnectTo<Client>`) as:
 
-### Step 3: Messaging (`broadcast` + `send`)
+```rust
+ConductorImpl::new_agent(
+    name,
+    ProxiesAndAgent::new(inner_agent).proxy(McpOverAcpPolyfill::http()),
+)
+```
 
-Implement message queuing, delivery on next turn, and wake-on-message for idle agents.
+Nested conductors compose: acpr runs its own inner conductor in front of
+`claude-acp`; from our outer conductor it is just an agent speaking ACP. The
+polyfill rewrites the daemon's `acp:` URL into a localhost bridge and tunnels
+`_mcp/*` back over ACP.
 
-- [ ] TBD
+The integration-test harness mirrors this: the test `RhaiAgentFactory` wraps the
+`RhaiAgent` the same way, so a Rhai script can call
+`mcp::call_tool("jamsession", "jamsession", #{ command: "help" })`. This is the
+pattern proven by `rhaicp`'s own `tests/mcp_tools.rs`.
 
-### Step 4: Worklist (`post-worklist`, `remove-worklist`, `show-worklist`)
+Slash commands (`/jamsession:*`) are **not** a separate ACP RPC — the agent
+advertises commands via `SessionUpdate::AvailableCommandsUpdate`, and invocation
+arrives as an ordinary `session/prompt`. So the daemon detects a leading
+`/jamsession:` text block in `handle_from_client`, handles it locally (updating
+team state, persisting the user message and the daemon's reply for replay), and
+does **not** forward it to the agent.
 
-- [ ] TBD
+Context/message injection reuses the guideline-delivery path: the daemon sends a
+`PromptRequest` to the agent. Since the central dispatcher only holds an
+`mpsc::UnboundedSender<Dispatch>` per agent, injection needs a small new seam — a
+per-agent control channel drained by the `agent_pipe` task, which turns each
+request into `cx.send_request(PromptRequest…)`.
 
-### Step 5: Key-value store (`store`, `retrieve`)
+## Step 1: Command core (pure logic, no ACP)
 
-- [ ] TBD
+New module `src/jamsession/src/jamsession_tool/command.rs`: the full
+`JamsessionCommand` enum (`#[serde(tag = "command", rename_all = "kebab-case")]`)
+with **every** variant from both RFDs present, plus a
+`dispatch(state, cmd) -> serde_json::Value`. At this step only `help` is live;
+every team command returns `{"error": "not a team member", …}`; unknown commands
+return `{"error": "unknown command …", "hint": …}`. The `help` output is the full
+static command table matching the RFD.
+
+**Red (unit):**
+
+- [ ] general `help` returns the full command table
+- [ ] `help` with `subcommand: "send"` returns the detailed `send` docs
+- [ ] an unknown command returns the structured error + hint
+- [ ] a team command (e.g. `send`) returns not-a-member when no team state exists
+
+## Step 2: MCP transport wiring (first, riskiest integration)
+
+Attach the `jamsession` MCP server in `agent_pipe` for both `New` and `Resume`
+sessions. The tool forwards raw JSON to a new
+`DispatcherMessage::JamsessionCommand { agent_id, input, respond }`; the
+dispatcher calls Step 1's `dispatch` (no team state yet) and replies over the
+oneshot. Wrap the test `RhaiAgent` in conductor + `McpOverAcpPolyfill::http()`
+(behind a flag so existing tests are undisturbed); add
+`agent-client-protocol-conductor`, `-polyfill`, and `-rmcp` to `jamsession-test`
+dev-deps.
+
+**Red (integration):**
+
+- [ ] a Rhai script `say(mcp::call_tool("jamsession", "jamsession", #{command:"help"}))`
+      returns the help table
+- [ ] unknown-command and not-a-member responses arrive over the real tool path
+
+## Step 3: Team persistence (pure DB)
+
+Add toasty models (`Team` + membership) and `Store` methods: `join_team`,
+`leave_team`, `list_teams`, `team_of_session`, `team_members`. The dispatcher
+rehydrates team state into an in-memory cache on startup, mirroring how sessions
+are rehydrated.
+
+**Red (unit, db-level):**
+
+- [ ] join / leave / list transitions
+- [ ] one-team-per-session invariant enforced
+- [ ] team membership survives a daemon restart (file-backed store)
+
+## Step 4: Slash commands + injection seam
+
+Intercept `/jamsession:{join-team,leave-team,teams}` in `handle_from_client`:
+update team state, persist the user message and the daemon's reply (for replay),
+respond via a client notification, and do **not** forward to the agent. Advertise
+the commands via a merged `AvailableCommandsUpdate`. On successful join, inject
+the `<context>…now a member…</context>` prompt to the live agent. Introduce the
+per-agent injection channel here.
+
+**Red (integration):**
+
+- [ ] `/jamsession:join-team foo` produces a daemon reply notification, the agent
+      is **not** prompted, and membership is now true
+- [ ] `/jamsession:teams` lists the active team and members
+
+## Step 5: Wire team state into dispatch + `list-members`
+
+`dispatch` now consults membership (agent_id → session → team). Implement
+`list-members`, returning each member's id, working_dir, and status.
+
+**Red (integration):**
+
+- [ ] after join, `list-members` returns the roster
+- [ ] before join, `list-members` still returns not-a-member
+
+## Step 6: Messaging (`send` + `broadcast`)
+
+The dispatcher resolves team members and injects
+`<team-message from="…" type="…">…</team-message>` to live recipients via the
+Step-4 seam. Messages for dead recipients are queued in a DB table and flushed on
+the recipient's next session activation. `send` to an unknown or off-team agent
+returns the structured error.
+
+**Red (integration):**
+
+- [ ] two sessions on one team: A `send`s B; B's script observes the team-message
+      via `receive_prompt()`
+- [ ] `broadcast` reaches all other peers and reports `delivered_to`
+- [ ] a message queued for a dead agent is delivered after it respawns
+
+## Step 7: Worklist (`post-worklist`, `remove-worklist`, `show-worklist`)
+
+Add the worklist DB table and `Store` methods, then the dispatch arms.
+
+**Red:**
+
+- [ ] db-level unit tests for post / remove / show and item counts
+- [ ] integration: post → show → remove with correct `id` and `items_count`
+
+## Step 8: Key-value store (`store`, `retrieve`)
+
+Add the shared-store DB table and `Store` methods, then the dispatch arms.
+
+**Red:**
+
+- [ ] db-level unit tests for store / retrieve (arbitrary JSON values)
+- [ ] integration: store → retrieve round-trips; missing key returns the error
