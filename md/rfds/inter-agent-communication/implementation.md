@@ -223,6 +223,17 @@ connection error and killed the agent. Injection now spawns the request and
 swallows its result, so it is truly fire-and-forget. (This also hardens Step 4's
 join-context injection.)
 
+Delivery is **at-least-once**: every message is durably queued
+(`PendingMessage`) *before* any injection, and a queued row is deleted only
+after it has been handed to the recipient's inject channel. Flush peeks (not
+bulk-takes) and deletes per-id, so an agent going away mid-flush leaves the
+remainder queued for its next activation. This queue-first design (added after an
+adversarial review flagged two message-loss windows — delete-before-delivery and
+a Quiescent-agent live/queue TOCTOU) closes both. Residual: a message handed to
+the inject channel but not yet consumed when the agent dies is not re-queued —
+inherent to fire-and-forget injection without a consumption ack, and acceptable
+until the mcp-over-acp rework adds delivery acks.
+
 **Red (integration):**
 
 - [x] two team members: a broadcast reaches a live peer as a `<team-message>`

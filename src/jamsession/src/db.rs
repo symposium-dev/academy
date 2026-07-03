@@ -461,27 +461,32 @@ impl Store {
         Ok(())
     }
 
-    /// Remove and return all pending messages for `session_id`, in send order.
-    pub async fn take_pending_messages(
+    /// Return all pending messages for `session_id`, in send order, as
+    /// `(id, body)` pairs — **without** removing them.
+    ///
+    /// Rows are deleted individually via [`delete_pending_message`](Self::delete_pending_message)
+    /// only after each message has been handed off for delivery, so a failure
+    /// mid-flush leaves undelivered messages durably queued (at-least-once).
+    pub async fn peek_pending_messages(
         &self,
         session_id: &str,
-    ) -> crate::error::Result<Vec<String>> {
+    ) -> crate::error::Result<Vec<(u64, String)>> {
         let mut db = self.db.clone();
         let pending = PendingMessage::filter(PendingMessage::fields().session_id().eq(session_id))
             .order_by(PendingMessage::fields().id().asc())
             .exec(&mut db)
             .await?;
+        Ok(pending.into_iter().map(|m| (m.id, m.body)).collect())
+    }
 
-        let bodies: Vec<String> = pending.into_iter().map(|m| m.body).collect();
-
-        if !bodies.is_empty() {
-            PendingMessage::filter(PendingMessage::fields().session_id().eq(session_id))
-                .delete()
-                .exec(&mut db)
-                .await?;
-        }
-
-        Ok(bodies)
+    /// Delete a single pending message by its id (after it has been delivered).
+    pub async fn delete_pending_message(&self, id: u64) -> crate::error::Result<()> {
+        let mut db = self.db.clone();
+        PendingMessage::filter_by_id(id)
+            .delete()
+            .exec(&mut db)
+            .await?;
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1072,27 +1077,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queue_and_take_pending_messages_in_order() {
+    async fn peek_and_delete_pending_messages_in_order() {
         let store = Store::in_memory().await.unwrap();
 
-        assert!(store.take_pending_messages("a").await.unwrap().is_empty());
+        assert!(store.peek_pending_messages("a").await.unwrap().is_empty());
 
         store.queue_message("a", "first").await.unwrap();
         store.queue_message("a", "second").await.unwrap();
         store.queue_message("b", "other").await.unwrap();
 
-        // Draining "a" returns its messages in send order and removes them.
+        // Peek returns messages in send order WITHOUT removing them.
+        let peeked = store.peek_pending_messages("a").await.unwrap();
         assert_eq!(
-            store.take_pending_messages("a").await.unwrap(),
+            peeked.iter().map(|(_, b)| b.clone()).collect::<Vec<_>>(),
             vec!["first".to_string(), "second".to_string()]
         );
-        assert!(store.take_pending_messages("a").await.unwrap().is_empty());
+        // Still present until explicitly deleted.
+        assert_eq!(store.peek_pending_messages("a").await.unwrap().len(), 2);
 
-        // "b" is unaffected by draining "a".
+        // Delete each by id; the queue drains one at a time.
+        store.delete_pending_message(peeked[0].0).await.unwrap();
         assert_eq!(
-            store.take_pending_messages("b").await.unwrap(),
-            vec!["other".to_string()]
+            store
+                .peek_pending_messages("a")
+                .await
+                .unwrap()
+                .iter()
+                .map(|(_, b)| b.clone())
+                .collect::<Vec<_>>(),
+            vec!["second".to_string()]
         );
+        store.delete_pending_message(peeked[1].0).await.unwrap();
+        assert!(store.peek_pending_messages("a").await.unwrap().is_empty());
+
+        // "b" is unaffected.
+        assert_eq!(store.peek_pending_messages("b").await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -1108,7 +1127,7 @@ mod tests {
 
         assert!(
             store
-                .take_pending_messages("sess-1")
+                .peek_pending_messages("sess-1")
                 .await
                 .unwrap()
                 .is_empty()

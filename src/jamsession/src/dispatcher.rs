@@ -605,15 +605,23 @@ impl<'scope> Dispatcher<'scope> {
     /// Deliver a rendered team message to `recipient_session_id`: inject it into
     /// the live agent if one is backing the session, else queue it for delivery
     /// when the agent next becomes ready.
+    ///
+    /// The message is **always** durably queued first, then flushed if the
+    /// recipient's agent is live. Queue-first delivery gives at-least-once
+    /// semantics and closes the race where a recipient judged "live" is torn
+    /// down before an injected-but-unqueued message is consumed: such a message
+    /// stays queued and is delivered on the recipient's next activation.
     async fn deliver_team_message(&self, recipient_session_id: &str, text: String) {
-        if self.session_has_live_agent(recipient_session_id) {
-            self.inject_to_agent(recipient_session_id, text).await;
-        } else if let Err(e) = self.store.queue_message(recipient_session_id, &text).await {
+        if let Err(e) = self.store.queue_message(recipient_session_id, &text).await {
             tracing::error!(
                 recipient = recipient_session_id,
                 error = %e,
                 "failed to queue team message"
             );
+            return;
+        }
+        if self.session_has_live_agent(recipient_session_id) {
+            self.flush_pending_messages(recipient_session_id).await;
         }
     }
 
@@ -852,28 +860,40 @@ impl<'scope> Dispatcher<'scope> {
 
     /// Inject an out-of-band context/message prompt into a live agent.
     ///
-    /// No-op if the session's agent is not currently alive.
-    async fn inject_to_agent(&self, session_id: &str, text: String) {
+    /// Returns whether the text was handed to a live agent's inject channel.
+    /// `false` if the session has no live agent (nothing was sent).
+    async fn inject_to_agent(&self, session_id: &str, text: String) -> bool {
         let Some(session) = self.sessions.get(session_id) else {
-            return;
+            return false;
         };
-        if let Some(agent) = self.agents.get(&session.agent_id) {
-            let _ = agent.inject_tx.send(text);
+        match self.agents.get(&session.agent_id) {
+            Some(agent) => agent.inject_tx.send(text).is_ok(),
+            None => false,
         }
     }
 
-    /// Deliver any team messages queued for `session_id` while its agent was not
-    /// live, injecting them in send order. Called when the agent becomes ready.
+    /// Deliver any team messages queued for `session_id`, in send order, and
+    /// delete each only after it has been handed to the agent's inject channel.
+    ///
+    /// Messages are peeked (not bulk-taken) so a mid-flush failure — the agent
+    /// going away, or a channel send failing — leaves the undelivered remainder
+    /// durably queued for the next activation. This keeps delivery at-least-once.
     async fn flush_pending_messages(&self, session_id: &str) {
-        let pending = match self.store.take_pending_messages(session_id).await {
+        let pending = match self.store.peek_pending_messages(session_id).await {
             Ok(pending) => pending,
             Err(e) => {
                 tracing::error!(session_id, error = %e, "failed to read pending messages");
                 return;
             }
         };
-        for text in pending {
-            self.inject_to_agent(session_id, text).await;
+        for (id, text) in pending {
+            if !self.inject_to_agent(session_id, text).await {
+                // Agent went away mid-flush; leave this and the rest queued.
+                break;
+            }
+            if let Err(e) = self.store.delete_pending_message(id).await {
+                tracing::error!(session_id, id, error = %e, "failed to delete delivered message");
+            }
         }
     }
 
