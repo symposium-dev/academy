@@ -51,6 +51,23 @@ pub struct Trace {
     pub payload: toasty::Json<serde_json::Value>,
 }
 
+/// A session's membership in a jamsession team.
+///
+/// Keyed by `session_id`, so a session belongs to at most one team — the
+/// one-team-per-session invariant is the primary key. A team "exists" exactly
+/// when at least one membership row references it; there is no separate teams
+/// table.
+#[derive(Debug, toasty::Model)]
+pub struct TeamMembership {
+    #[key]
+    pub session_id: String,
+
+    #[index]
+    pub team: String,
+
+    pub joined_at: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionRecord {
     pub session_id: String,
@@ -124,7 +141,7 @@ impl Store {
         }
 
         let db = toasty::Db::builder()
-            .models(toasty::models!(Session, Message, Trace))
+            .models(toasty::models!(Session, Message, Trace, TeamMembership))
             .build(toasty_driver_sqlite::Sqlite::open(path))
             .await?;
 
@@ -132,8 +149,19 @@ impl Store {
 
         if !table_exists(&db, "sessions").await? {
             db.push_schema().await?;
-        } else if !table_exists(&db, "traces").await? {
-            create_trace_schema(&db).await?;
+        } else {
+            // Existing database: add any tables introduced after it was
+            // created. These are always a suffix of the registered models
+            // (tables are only ever appended), so they can be added together.
+            let mut missing = Vec::new();
+            for table in ["traces", "team_memberships"] {
+                if !table_exists(&db, table).await? {
+                    missing.push(table);
+                }
+            }
+            if !missing.is_empty() {
+                add_missing_tables(&db, &missing).await?;
+            }
         }
 
         Ok(Self { db })
@@ -141,7 +169,7 @@ impl Store {
 
     pub async fn in_memory() -> crate::error::Result<Self> {
         let db = toasty::Db::builder()
-            .models(toasty::models!(Session, Message, Trace))
+            .models(toasty::models!(Session, Message, Trace, TeamMembership))
             .build(toasty_driver_sqlite::Sqlite::in_memory())
             .await?;
         db.push_schema().await?;
@@ -241,12 +269,94 @@ impl Store {
             .delete()
             .exec(&mut db)
             .await?;
+        TeamMembership::filter(TeamMembership::fields().session_id().eq(session_id))
+            .delete()
+            .exec(&mut db)
+            .await?;
         Session::filter(Session::fields().id().eq(session_id))
             .delete()
             .exec(&mut db)
             .await?;
 
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Team membership
+    // -----------------------------------------------------------------------
+
+    /// Join `session_id` to `team`, creating the team if it is new.
+    ///
+    /// A session belongs to at most one team, so joining replaces any previous
+    /// membership for that session.
+    pub async fn join_team(&self, session_id: &str, team: &str) -> crate::error::Result<()> {
+        let mut db = self.db.clone();
+
+        // Replace any existing membership (one team per session).
+        TeamMembership::filter(TeamMembership::fields().session_id().eq(session_id))
+            .delete()
+            .exec(&mut db)
+            .await?;
+
+        toasty::create!(TeamMembership {
+            session_id: session_id.to_string(),
+            team: team.to_string(),
+            joined_at: Utc::now().to_rfc3339(),
+        })
+        .exec(&mut db)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Remove `session_id` from whatever team it is on, if any.
+    pub async fn leave_team(&self, session_id: &str) -> crate::error::Result<()> {
+        let mut db = self.db.clone();
+        TeamMembership::filter(TeamMembership::fields().session_id().eq(session_id))
+            .delete()
+            .exec(&mut db)
+            .await?;
+        Ok(())
+    }
+
+    /// The team `session_id` currently belongs to, or `None`.
+    pub async fn team_of_session(&self, session_id: &str) -> crate::error::Result<Option<String>> {
+        let mut db = self.db.clone();
+        let membership =
+            TeamMembership::filter(TeamMembership::fields().session_id().eq(session_id))
+                .exec(&mut db)
+                .await?
+                .into_iter()
+                .next();
+        Ok(membership.map(|m| m.team))
+    }
+
+    /// The session ids of every member of `team`, in ascending id order.
+    pub async fn team_members(&self, team: &str) -> crate::error::Result<Vec<String>> {
+        let mut db = self.db.clone();
+        let mut members: Vec<String> =
+            TeamMembership::filter(TeamMembership::fields().team().eq(team))
+                .exec(&mut db)
+                .await?
+                .into_iter()
+                .map(|m| m.session_id)
+                .collect();
+        members.sort();
+        Ok(members)
+    }
+
+    /// The names of all active teams (those with at least one member), sorted.
+    pub async fn list_teams(&self) -> crate::error::Result<Vec<String>> {
+        let mut db = self.db.clone();
+        let mut teams: Vec<String> = Query::<List<TeamMembership>>::all()
+            .exec(&mut db)
+            .await?
+            .into_iter()
+            .map(|m| m.team)
+            .collect();
+        teams.sort();
+        teams.dedup();
+        Ok(teams)
     }
 
     pub async fn record_trace(&self, trace: NewTrace) -> crate::error::Result<()> {
@@ -321,12 +431,23 @@ async fn table_exists_on(
     ))
 }
 
-async fn create_trace_schema(db: &toasty::Db) -> crate::error::Result<()> {
+/// Add missing tables to an existing database.
+///
+/// Diffs the current model schema against a copy with `table_names` removed, so
+/// the generated migration contains only the statements that create those
+/// tables (plus their indexes). Used to evolve older databases that predate a
+/// table without a full rebuild.
+///
+/// The removed tables must be a *suffix* of the registered models (toasty
+/// identifies tables by positional id, so removing a non-final table would
+/// shift the ids of surviving tables and corrupt the schema). Tables are only
+/// ever appended in this crate, so newly-missing tables are always a suffix.
+async fn add_missing_tables(db: &toasty::Db, table_names: &[&str]) -> crate::error::Result<()> {
     let next_schema = db.schema().db.clone();
     let mut previous_schema = next_schema.clone();
     previous_schema
         .tables
-        .retain(|table| table.name != "traces");
+        .retain(|table| !table_names.contains(&table.name.as_str()));
 
     let Some(generated) = toasty::migration::generate(
         db.driver(),
@@ -343,10 +464,6 @@ async fn create_trace_schema(db: &toasty::Db) -> crate::error::Result<()> {
         .await?;
 
     let result = async {
-        if table_exists_on(&mut conn, "traces").await? {
-            return Ok(());
-        }
-
         for statement in generated.migration.statements() {
             toasty::sql::statement(statement).exec(&mut conn).await?;
         }
@@ -598,6 +715,112 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn join_leave_and_list_teams() {
+        let store = Store::in_memory().await.unwrap();
+
+        assert!(store.list_teams().await.unwrap().is_empty());
+        assert_eq!(store.team_of_session("a").await.unwrap(), None);
+
+        store.join_team("a", "frontend").await.unwrap();
+        store.join_team("b", "frontend").await.unwrap();
+        store.join_team("c", "backend").await.unwrap();
+
+        assert_eq!(
+            store.team_of_session("a").await.unwrap().as_deref(),
+            Some("frontend")
+        );
+        assert_eq!(
+            store.list_teams().await.unwrap(),
+            vec!["backend".to_string(), "frontend".to_string()]
+        );
+        assert_eq!(
+            store.team_members("frontend").await.unwrap(),
+            vec!["a".to_string(), "b".to_string()]
+        );
+
+        store.leave_team("a").await.unwrap();
+        assert_eq!(store.team_of_session("a").await.unwrap(), None);
+        assert_eq!(
+            store.team_members("frontend").await.unwrap(),
+            vec!["b".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn joining_a_second_team_replaces_membership() {
+        let store = Store::in_memory().await.unwrap();
+
+        store.join_team("a", "frontend").await.unwrap();
+        store.join_team("a", "backend").await.unwrap();
+
+        // One-team-per-session: the session is only on the most recent team.
+        assert_eq!(
+            store.team_of_session("a").await.unwrap().as_deref(),
+            Some("backend")
+        );
+        assert!(store.team_members("frontend").await.unwrap().is_empty());
+        assert_eq!(
+            store.team_members("backend").await.unwrap(),
+            vec!["a".to_string()]
+        );
+        assert_eq!(
+            store.list_teams().await.unwrap(),
+            vec!["backend".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_session_clears_team_membership() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(&dir.path().join("jamsession.db"))
+            .await
+            .unwrap();
+        store.add_session("sess-1", dir.path()).await.unwrap();
+        store.join_team("sess-1", "frontend").await.unwrap();
+
+        store.remove_session("sess-1").await.unwrap();
+
+        assert_eq!(store.team_of_session("sess-1").await.unwrap(), None);
+        assert!(store.list_teams().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn team_membership_survives_reopen() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("jamsession.db");
+        {
+            let store = Store::open(&db_path).await.unwrap();
+            store.join_team("a", "frontend").await.unwrap();
+        }
+        let store = Store::open(&db_path).await.unwrap();
+        assert_eq!(
+            store.team_of_session("a").await.unwrap().as_deref(),
+            Some("frontend")
+        );
+    }
+
+    #[tokio::test]
+    async fn open_adds_team_table_to_existing_database() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("jamsession.db");
+        // Simulate a database created before the team_memberships table existed.
+        let old_db = toasty::Db::builder()
+            .models(toasty::models!(Session, Message, Trace))
+            .build(toasty_driver_sqlite::Sqlite::open(&db_path))
+            .await
+            .unwrap();
+        old_db.push_schema().await.unwrap();
+        drop(old_db);
+
+        let store = Store::open(&db_path).await.unwrap();
+        store.join_team("a", "frontend").await.unwrap();
+        assert_eq!(
+            store.team_of_session("a").await.unwrap().as_deref(),
+            Some("frontend")
         );
     }
 }
