@@ -148,10 +148,6 @@ Structured input means the daemon can validate and give precise errors. It also 
 
 The tool description says to. Additionally, when the daemon injects context (e.g., on team join), it reminds the agent about the tool and its commands explicitly — so in practice the agent rarely needs to call `help` cold.
 
-## Implementation plan and status
+## Implementation
 
-### Step 1: Tool registration and `help` dispatch
-
-Register the `jamsession` tool with agents. Implement the command dispatch skeleton and the `help` command returning the static command table.
-
-- [ ] TBD
+See [Implementation plan and status](./implementation.md).

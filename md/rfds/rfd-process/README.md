@@ -14,7 +14,7 @@ This particular RFD process is also experimenting with the development process t
 
 ## Change in a nutshell
 
-When planning a larger change, first create a PR adding an RFD that lays out the design and plans. Once the PR is accepted, implementation PRs should modify the implementation plan and keep it up-to-date, making it easier for reviewers or others to understand how the work that is being done relates to the design.
+When planning a larger change, first create a PR adding an RFD that lays out the design and plans. Once the PR is accepted, implementation PRs should modify the implementation plan (in the RFD's `implementation.md`) and keep it up-to-date, making it easier for reviewers or others to understand how the work that is being done relates to the design.
 
 Once the RFD is accepted, team members are encouraged to land PRs independently if they feel confident in the changes. For newer contributors, review should be a simpler process.
 
@@ -31,7 +31,9 @@ The template contains the following sections:
 - **Change in a nutshell** — the most important changes
 - **Detailed plans** — full design, with subchapters as needed
 - **Frequently asked questions** — rationale, alternatives, discussion
-- **Implementation plan and status** — checklist of steps, updated as work lands
+- **Implementation** — a one-line pointer to the RFD's `implementation.md`
+
+The implementation plan itself lives in a sibling `implementation.md` file (a **checklist of steps, updated as work lands**), not in `README.md`. This keeps the design stable while the plan churns during implementation, so the two can be reviewed and revised independently. Every file in an RFD directory — including `implementation.md` and any subchapters — must be linked from `SUMMARY.md`.
 
 ### Style requirements
 
@@ -56,15 +58,8 @@ The goal is to stay out of the way and keep a record. Merging an RFD or even a P
 
 ### What if the design changes during implementation?
 
-Update the RFD's status section to note deviations. The RFD is a living document until it moves to "Completed".
+Update the RFD's `implementation.md` to note deviations. The RFD is a living document until it moves to "Completed".
 
-## Implementation plan and status
+## Implementation
 
-### Initial PR
-
-- [x] Add RFD template (`md/rfds/TEMPLATE/README.md`)
-- [x] Add RFD index pages (`accepted.md`, `completed.md`)
-- [x] Add SUMMARY.md entries
-- [x] Write this meta-RFD as a demonstration
-
-No tests required.
+See [Implementation plan and status](./implementation.md).
