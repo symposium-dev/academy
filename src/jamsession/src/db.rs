@@ -87,6 +87,45 @@ pub struct PendingMessage {
     pub queued_at: String,
 }
 
+/// An item on a team's shared worklist.
+///
+/// Scoped by `team` (shared across the team's members). The public item id is
+/// rendered as `wl-<id>` from the auto-increment `id`.
+#[derive(Debug, toasty::Model)]
+pub struct WorklistItem {
+    #[key]
+    #[auto]
+    pub id: u64,
+
+    #[index]
+    pub team: String,
+
+    pub item: String,
+    /// The session id of the member who posted the item.
+    pub posted_by: String,
+    pub posted_at: String,
+}
+
+/// A key-value entry in a team's shared store.
+///
+/// Scoped by `team`; `key` is unique within a team. The value is JSON-encoded.
+#[derive(Debug, toasty::Model)]
+pub struct StoreEntry {
+    #[key]
+    #[auto]
+    pub id: u64,
+
+    #[index]
+    pub team: String,
+
+    #[index]
+    pub key: String,
+
+    /// The JSON-encoded value.
+    pub value: String,
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionRecord {
     pub session_id: String,
@@ -165,7 +204,9 @@ impl Store {
                 Message,
                 Trace,
                 TeamMembership,
-                PendingMessage
+                PendingMessage,
+                WorklistItem,
+                StoreEntry
             ))
             .build(toasty_driver_sqlite::Sqlite::open(path))
             .await?;
@@ -179,7 +220,13 @@ impl Store {
             // created. These are always a suffix of the registered models
             // (tables are only ever appended), so they can be added together.
             let mut missing = Vec::new();
-            for table in ["traces", "team_memberships", "pending_messages"] {
+            for table in [
+                "traces",
+                "team_memberships",
+                "pending_messages",
+                "worklist_items",
+                "store_entries",
+            ] {
                 if !table_exists(&db, table).await? {
                     missing.push(table);
                 }
@@ -199,7 +246,9 @@ impl Store {
                 Message,
                 Trace,
                 TeamMembership,
-                PendingMessage
+                PendingMessage,
+                WorklistItem,
+                StoreEntry
             ))
             .build(toasty_driver_sqlite::Sqlite::in_memory())
             .await?;
@@ -433,6 +482,128 @@ impl Store {
         }
 
         Ok(bodies)
+    }
+
+    // -----------------------------------------------------------------------
+    // Team worklist
+    // -----------------------------------------------------------------------
+
+    /// Add an item to `team`'s worklist and return its numeric id.
+    pub async fn add_worklist_item(
+        &self,
+        team: &str,
+        item: &str,
+        posted_by: &str,
+    ) -> crate::error::Result<u64> {
+        let mut db = self.db.clone();
+        let created = toasty::create!(WorklistItem {
+            team: team.to_string(),
+            item: item.to_string(),
+            posted_by: posted_by.to_string(),
+            posted_at: Utc::now().to_rfc3339(),
+        })
+        .exec(&mut db)
+        .await?;
+        Ok(created.id)
+    }
+
+    /// Remove worklist item `id` from `team`. Returns whether a row was removed.
+    pub async fn remove_worklist_item(&self, team: &str, id: u64) -> crate::error::Result<bool> {
+        let mut db = self.db.clone();
+        let existing = WorklistItem::filter(WorklistItem::fields().team().eq(team))
+            .exec(&mut db)
+            .await?
+            .into_iter()
+            .any(|w| w.id == id);
+        if existing {
+            WorklistItem::filter_by_id(id)
+                .delete()
+                .exec(&mut db)
+                .await?;
+        }
+        Ok(existing)
+    }
+
+    /// The number of items on `team`'s worklist.
+    pub async fn worklist_count(&self, team: &str) -> crate::error::Result<usize> {
+        let mut db = self.db.clone();
+        Ok(WorklistItem::filter(WorklistItem::fields().team().eq(team))
+            .exec(&mut db)
+            .await?
+            .len())
+    }
+
+    /// All items on `team`'s worklist, in post order, as `(id, item, posted_by)`.
+    pub async fn worklist_items(
+        &self,
+        team: &str,
+    ) -> crate::error::Result<Vec<(u64, String, String)>> {
+        let mut db = self.db.clone();
+        Ok(WorklistItem::filter(WorklistItem::fields().team().eq(team))
+            .order_by(WorklistItem::fields().id().asc())
+            .exec(&mut db)
+            .await?
+            .into_iter()
+            .map(|w| (w.id, w.item, w.posted_by))
+            .collect())
+    }
+
+    // -----------------------------------------------------------------------
+    // Team key-value store
+    // -----------------------------------------------------------------------
+
+    /// Store `value` (JSON-encoded) under `key` for `team`, replacing any prior
+    /// value for that key.
+    pub async fn store_put(
+        &self,
+        team: &str,
+        key: &str,
+        value: &serde_json::Value,
+    ) -> crate::error::Result<()> {
+        let mut db = self.db.clone();
+        let encoded = serde_json::to_string(value)?;
+
+        // Replace any existing entry for this (team, key).
+        let existing: Vec<StoreEntry> = StoreEntry::filter(StoreEntry::fields().team().eq(team))
+            .exec(&mut db)
+            .await?
+            .into_iter()
+            .filter(|e| e.key == key)
+            .collect();
+        for entry in existing {
+            StoreEntry::filter_by_id(entry.id)
+                .delete()
+                .exec(&mut db)
+                .await?;
+        }
+
+        toasty::create!(StoreEntry {
+            team: team.to_string(),
+            key: key.to_string(),
+            value: encoded,
+            updated_at: Utc::now().to_rfc3339(),
+        })
+        .exec(&mut db)
+        .await?;
+        Ok(())
+    }
+
+    /// Retrieve the value stored under `key` for `team`, if present.
+    pub async fn store_get(
+        &self,
+        team: &str,
+        key: &str,
+    ) -> crate::error::Result<Option<serde_json::Value>> {
+        let mut db = self.db.clone();
+        let entry = StoreEntry::filter(StoreEntry::fields().team().eq(team))
+            .exec(&mut db)
+            .await?
+            .into_iter()
+            .find(|e| e.key == key);
+        match entry {
+            Some(e) => Ok(Some(serde_json::from_str(&e.value)?)),
+            None => Ok(None),
+        }
     }
 
     pub async fn record_trace(&self, trace: NewTrace) -> crate::error::Result<()> {
@@ -942,5 +1113,80 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn worklist_post_show_remove() {
+        let store = Store::in_memory().await.unwrap();
+
+        assert_eq!(store.worklist_count("frontend").await.unwrap(), 0);
+
+        let id1 = store
+            .add_worklist_item("frontend", "set up fixtures", "agent-1")
+            .await
+            .unwrap();
+        let id2 = store
+            .add_worklist_item("frontend", "define API", "agent-2")
+            .await
+            .unwrap();
+        // A different team's worklist is independent.
+        store
+            .add_worklist_item("backend", "unrelated", "agent-3")
+            .await
+            .unwrap();
+
+        assert_eq!(store.worklist_count("frontend").await.unwrap(), 2);
+        let items = store.worklist_items("frontend").await.unwrap();
+        assert_eq!(
+            items,
+            vec![
+                (id1, "set up fixtures".to_string(), "agent-1".to_string()),
+                (id2, "define API".to_string(), "agent-2".to_string()),
+            ]
+        );
+
+        // Remove one item; the count drops and the other survives.
+        assert!(store.remove_worklist_item("frontend", id1).await.unwrap());
+        assert_eq!(store.worklist_count("frontend").await.unwrap(), 1);
+        // Removing a non-existent id is a no-op returning false.
+        assert!(!store.remove_worklist_item("frontend", 9999).await.unwrap());
+        // Cannot remove another team's item via the wrong team scope.
+        assert!(
+            !store
+                .remove_worklist_item("frontend", id2 + 100)
+                .await
+                .unwrap()
+        );
+
+        assert_eq!(store.worklist_count("backend").await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn store_put_get_and_replace() {
+        let store = Store::in_memory().await.unwrap();
+
+        assert_eq!(store.store_get("frontend", "url").await.unwrap(), None);
+
+        store
+            .store_put("frontend", "url", &serde_json::json!("http://a"))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.store_get("frontend", "url").await.unwrap(),
+            Some(serde_json::json!("http://a"))
+        );
+
+        // Overwriting the same key replaces the value (no duplicates).
+        store
+            .store_put("frontend", "url", &serde_json::json!({"port": 3000}))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.store_get("frontend", "url").await.unwrap(),
+            Some(serde_json::json!({"port": 3000}))
+        );
+
+        // Team scoping: another team does not see frontend's value.
+        assert_eq!(store.store_get("backend", "url").await.unwrap(), None);
     }
 }

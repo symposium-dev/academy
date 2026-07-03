@@ -443,20 +443,39 @@ impl<'scope> Dispatcher<'scope> {
 
         let ctx = self.team_context_for(session_id.as_deref()).await;
 
-        // Side-effecting team commands (send/broadcast) are handled here in the
-        // dispatcher, since they inject into *other* agents and queue to the DB.
-        // Everything else is answered by the pure command dispatch.
-        let response = match parse_message_command(&input, &ctx) {
-            Some(MessageCommand::Send { to, message }) => {
-                self.handle_send(&ctx, &to, &message).await
-            }
-            Some(MessageCommand::Broadcast { message }) => {
-                self.handle_broadcast(&ctx, &message).await
-            }
+        // Side-effecting team commands (messaging, worklist, store) touch other
+        // agents or the database, so the dispatcher handles them. Pure commands
+        // (help, list-members, and the membership errors) go to the command core.
+        let response = match effectful_command(&input, &ctx) {
+            Some(cmd) => self.handle_effectful_command(&ctx, cmd).await,
             None => jamsession_tool::dispatch_json(input, &ctx),
         };
         // The agent may have gone away before we could answer; that is benign.
         let _ = respond.send(response);
+    }
+
+    /// Handle a side-effecting team command against the caller's context.
+    async fn handle_effectful_command(
+        &self,
+        ctx: &jamsession_tool::TeamContext,
+        cmd: jamsession_tool::JamsessionCommand,
+    ) -> serde_json::Value {
+        use jamsession_tool::JamsessionCommand as C;
+        // Only reachable for on-team callers (see `effectful_command`).
+        let team = ctx.team.as_deref().unwrap_or_default();
+        match cmd {
+            C::Send { to, message } => self.handle_send(ctx, &to, &message).await,
+            C::Broadcast { message } => self.handle_broadcast(ctx, &message).await,
+            C::PostWorklist { item } => self.handle_post_worklist(team, ctx, &item).await,
+            C::RemoveWorklist { id } => self.handle_remove_worklist(team, &id).await,
+            C::ShowWorklist => self.handle_show_worklist(team).await,
+            C::Store { key, value } => self.handle_store(team, &key, value).await,
+            C::Retrieve { key } => self.handle_retrieve(team, &key).await,
+            // Non-effectful variants never reach here.
+            C::Help { .. } | C::ListMembers => serde_json::json!({
+                "error": "command not handled here",
+            }),
+        }
     }
 
     /// Handle `send`: deliver a direct message to one team member.
@@ -497,6 +516,90 @@ impl<'scope> Dispatcher<'scope> {
             delivered_to.push(member.id.clone());
         }
         serde_json::json!({ "delivered_to": delivered_to })
+    }
+
+    // -----------------------------------------------------------------------
+    // Worklist commands
+    // -----------------------------------------------------------------------
+
+    /// Handle `post-worklist`: add an item to the team's shared worklist.
+    async fn handle_post_worklist(
+        &self,
+        team: &str,
+        ctx: &jamsession_tool::TeamContext,
+        item: &str,
+    ) -> serde_json::Value {
+        match self.store.add_worklist_item(team, item, &ctx.me).await {
+            Ok(id) => {
+                let count = self.store.worklist_count(team).await.unwrap_or(0);
+                serde_json::json!({ "id": worklist_id(id), "items_count": count })
+            }
+            Err(e) => internal_command_error(e),
+        }
+    }
+
+    /// Handle `remove-worklist`: remove an item by its `wl-<n>` id.
+    async fn handle_remove_worklist(&self, team: &str, id: &str) -> serde_json::Value {
+        let Some(numeric) = parse_worklist_id(id) else {
+            return serde_json::json!({ "error": "unknown worklist id", "id": id });
+        };
+        match self.store.remove_worklist_item(team, numeric).await {
+            Ok(removed) => {
+                let count = self.store.worklist_count(team).await.unwrap_or(0);
+                if removed {
+                    serde_json::json!({ "removed": true, "items_count": count })
+                } else {
+                    serde_json::json!({ "error": "unknown worklist id", "id": id })
+                }
+            }
+            Err(e) => internal_command_error(e),
+        }
+    }
+
+    /// Handle `show-worklist`: list the team's worklist items.
+    async fn handle_show_worklist(&self, team: &str) -> serde_json::Value {
+        match self.store.worklist_items(team).await {
+            Ok(items) => {
+                let items: Vec<_> = items
+                    .into_iter()
+                    .map(|(id, item, posted_by)| {
+                        serde_json::json!({
+                            "id": worklist_id(id),
+                            "item": item,
+                            "posted_by": posted_by,
+                        })
+                    })
+                    .collect();
+                serde_json::json!({ "items": items })
+            }
+            Err(e) => internal_command_error(e),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Key-value store commands
+    // -----------------------------------------------------------------------
+
+    /// Handle `store`: put a key-value pair in the team's shared store.
+    async fn handle_store(
+        &self,
+        team: &str,
+        key: &str,
+        value: serde_json::Value,
+    ) -> serde_json::Value {
+        match self.store.store_put(team, key, &value).await {
+            Ok(()) => serde_json::json!({ "stored": true }),
+            Err(e) => internal_command_error(e),
+        }
+    }
+
+    /// Handle `retrieve`: get a value from the team's shared store.
+    async fn handle_retrieve(&self, team: &str, key: &str) -> serde_json::Value {
+        match self.store.store_get(team, key).await {
+            Ok(Some(value)) => serde_json::json!({ "key": key, "value": value }),
+            Ok(None) => serde_json::json!({ "error": "key not found", "key": key }),
+            Err(e) => internal_command_error(e),
+        }
     }
 
     /// Deliver a rendered team message to `recipient_session_id`: inject it into
@@ -1739,32 +1842,46 @@ impl<'scope> Dispatcher<'scope> {
     }
 }
 
-/// A side-effecting team message command that the dispatcher (not the pure
-/// command core) must handle.
-enum MessageCommand {
-    Send { to: String, message: String },
-    Broadcast { message: String },
+/// Render a numeric worklist id as its public `wl-<n>` form.
+fn worklist_id(id: u64) -> String {
+    format!("wl-{id}")
 }
 
-/// Extract a side-effecting `send`/`broadcast` from the raw tool input, but only
-/// when the caller is on a team.
+/// Parse a public `wl-<n>` worklist id back to its numeric form.
+fn parse_worklist_id(id: &str) -> Option<u64> {
+    id.strip_prefix("wl-").and_then(|n| n.parse().ok())
+}
+
+/// A generic error response for a command whose underlying store operation
+/// failed. The error is logged; the agent sees a terse message.
+fn internal_command_error(e: crate::error::Error) -> serde_json::Value {
+    tracing::error!(error = %e, "jamsession command failed");
+    serde_json::json!({ "error": "internal error" })
+}
+
+/// Extract a side-effecting team command (messaging, worklist, store) from the
+/// raw tool input, but only when the caller is on a team.
 ///
 /// Off-team callers return `None` so the request flows to the pure dispatch,
-/// which reports not-a-member. Malformed input also returns `None`, so the pure
-/// dispatch produces the invalid-arguments error (single source of truth for
-/// that message).
-fn parse_message_command(
+/// which reports not-a-member. Malformed input and non-effectful commands
+/// (`help`, `list-members`) also return `None`, so the pure dispatch produces
+/// the right response (single source of truth for those messages).
+fn effectful_command(
     input: &serde_json::Value,
     ctx: &jamsession_tool::TeamContext,
-) -> Option<MessageCommand> {
+) -> Option<jamsession_tool::JamsessionCommand> {
+    use jamsession_tool::JamsessionCommand as C;
     ctx.team.as_ref()?;
-    match serde_json::from_value::<jamsession_tool::JamsessionCommand>(input.clone()) {
-        Ok(jamsession_tool::JamsessionCommand::Send { to, message }) => {
-            Some(MessageCommand::Send { to, message })
-        }
-        Ok(jamsession_tool::JamsessionCommand::Broadcast { message }) => {
-            Some(MessageCommand::Broadcast { message })
-        }
+    match serde_json::from_value::<C>(input.clone()) {
+        Ok(
+            cmd @ (C::Send { .. }
+            | C::Broadcast { .. }
+            | C::PostWorklist { .. }
+            | C::RemoveWorklist { .. }
+            | C::ShowWorklist
+            | C::Store { .. }
+            | C::Retrieve { .. }),
+        ) => Some(cmd),
         _ => None,
     }
 }

@@ -233,16 +233,28 @@ join-context injection.)
 
 Add the worklist DB table and `Store` methods, then the dispatch arms.
 
+**Status: done.** `WorklistItem` model scoped by `team`; the public id is
+`wl-<n>`. The dispatch arms live in the dispatcher (they write the DB), reached
+via a generalized `effectful_command` seam that routes every side-effecting
+on-team command (messaging, worklist, store) to the dispatcher while pure
+commands stay in the command core.
+
 **Red:**
 
-- [ ] db-level unit tests for post / remove / show and item counts
-- [ ] integration: post → show → remove with correct `id` and `items_count`
+- [x] db-level unit tests for post / remove / show, item counts, and team scoping
+- [x] integration: post → show → remove with correct `id` and `items_count`,
+      plus an unknown-id error
 
 ## Step 8: Key-value store (`store`, `retrieve`)
 
 Add the shared-store DB table and `Store` methods, then the dispatch arms.
 
+**Status: done.** `StoreEntry` model scoped by `team`; `store_put` replaces any
+prior value for a key (last-write-wins), and values are arbitrary JSON. Dispatch
+arms sit alongside the worklist arms behind the same `effectful_command` seam.
+
 **Red:**
 
-- [ ] db-level unit tests for store / retrieve (arbitrary JSON values)
-- [ ] integration: store → retrieve round-trips; missing key returns the error
+- [x] db-level unit tests for store / retrieve (string + object values), replace,
+      and team scoping
+- [x] integration: store → retrieve round-trips, overwrite, and missing-key error
