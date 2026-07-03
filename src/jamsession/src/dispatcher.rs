@@ -5,9 +5,9 @@ use std::sync::Arc;
 use agent_client_protocol::schema::{
     ContentChunk, InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
     LoadSessionRequest, LoadSessionResponse, McpServer, NewSessionRequest, NewSessionResponse,
-    PromptRequest, ProtocolVersion, ResumeSessionRequest, ResumeSessionResponse,
+    PromptRequest, PromptResponse, ProtocolVersion, ResumeSessionRequest, ResumeSessionResponse,
     SessionConfigOptionCategory, SessionId as AcpSessionId, SessionInfo, SessionNotification,
-    SessionUpdate, SetSessionConfigOptionRequest,
+    SessionUpdate, SetSessionConfigOptionRequest, StopReason,
 };
 use agent_client_protocol::util::MatchDispatch;
 use agent_client_protocol::{
@@ -24,7 +24,9 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::agent::AgentFactory;
 use crate::db::{NewTrace, SessionRecord, Store, TraceDirection, TraceKind};
-use crate::jamsession_tool::{self, JamsessionTool, JamsessionToolCall, ToolCallSender};
+use crate::jamsession_tool::{
+    self, JamsessionTool, JamsessionToolCall, SlashCommand, ToolCallSender,
+};
 use crate::session::{LifecycleEvent, LifecycleEventSender};
 
 // ---------------------------------------------------------------------------
@@ -45,6 +47,7 @@ pub(super) enum DispatcherMessage {
     ClientRegistered {
         client_id: ClientId,
         outgoing_tx: mpsc::UnboundedSender<Dispatch>,
+        slash_reply_tx: mpsc::UnboundedSender<SlashReply>,
     },
     ClientDisconnected {
         client_id: ClientId,
@@ -52,6 +55,7 @@ pub(super) enum DispatcherMessage {
     AgentReady {
         agent_id: AgentId,
         outgoing_tx: mpsc::UnboundedSender<Dispatch>,
+        inject_tx: mpsc::UnboundedSender<String>,
         session_id: SessionId,
         client_id: ClientId,
         cwd: PathBuf,
@@ -136,10 +140,27 @@ struct Session {
 
 struct ClientHandle {
     outgoing_tx: mpsc::UnboundedSender<Dispatch>,
+    /// Channel for delivering a slash-command reply as an ordered unit: the
+    /// agent-message notification followed by the terminating prompt response.
+    /// Both are emitted from the client pipe task (which owns the connection),
+    /// guaranteeing the reply text reaches the client before the response.
+    slash_reply_tx: mpsc::UnboundedSender<SlashReply>,
+}
+
+/// A slash-command reply to deliver to a client: an agent-message chunk (as an
+/// untyped `session/update` notification) followed by the `PromptResponse` that
+/// ends the turn. Delivered as a unit so the two cannot race.
+pub(super) struct SlashReply {
+    notification: agent_client_protocol::UntypedMessage,
+    responder: Responder<PromptResponse>,
 }
 
 struct AgentHandle {
     outgoing_tx: mpsc::UnboundedSender<Dispatch>,
+    /// Channel for injecting out-of-band context/messages into the agent's
+    /// conversation. Text sent here is delivered to the agent as a
+    /// `session/prompt` by the agent pipe. See [`Dispatcher::inject_to_agent`].
+    inject_tx: mpsc::UnboundedSender<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -287,8 +308,15 @@ impl<'scope> Dispatcher<'scope> {
             DispatcherMessage::ClientRegistered {
                 client_id,
                 outgoing_tx,
+                slash_reply_tx,
             } => {
-                self.clients.insert(client_id, ClientHandle { outgoing_tx });
+                self.clients.insert(
+                    client_id,
+                    ClientHandle {
+                        outgoing_tx,
+                        slash_reply_tx,
+                    },
+                );
                 self.trace_event(
                     None,
                     "acp-client",
@@ -304,6 +332,7 @@ impl<'scope> Dispatcher<'scope> {
             DispatcherMessage::AgentReady {
                 agent_id,
                 outgoing_tx,
+                inject_tx,
                 session_id,
                 client_id,
                 cwd,
@@ -312,6 +341,7 @@ impl<'scope> Dispatcher<'scope> {
                 self.handle_agent_ready(
                     agent_id,
                     outgoing_tx,
+                    inject_tx,
                     session_id,
                     client_id,
                     cwd,
@@ -413,6 +443,186 @@ impl<'scope> Dispatcher<'scope> {
     }
 
     // -----------------------------------------------------------------------
+    // Slash commands
+    // -----------------------------------------------------------------------
+
+    /// Handle a `/jamsession:*` slash command locally.
+    ///
+    /// The command is driven by the human, not the agent: the daemon updates
+    /// team state, persists both the user's command and its own reply (so they
+    /// replay on reconnect), answers the client, and — on a successful join —
+    /// injects a context message into the live agent. The agent is never sent
+    /// the slash command itself.
+    async fn handle_slash_command(
+        &mut self,
+        client_id: ClientId,
+        req: PromptRequest,
+        command: SlashCommand,
+        responder: Responder<PromptResponse>,
+    ) {
+        // The command and reply are part of the user-facing conversation, so
+        // persist the user's prompt like any other.
+        self.persist_user_message(client_id, &req).await;
+
+        let Some(session_id) = self.client_to_session.get(&client_id).cloned() else {
+            // No session yet: reply directly on the client connection (no
+            // session id to key an AgentMessageChunk or to persist against).
+            self.reply_without_session(
+                client_id,
+                "No active session; start one before using /jamsession commands.",
+                responder,
+            );
+            return;
+        };
+
+        let (reply, inject) = self.apply_slash_command(&session_id, command).await;
+
+        // Deliver the reply as an ordered unit (notification then response) so
+        // the reply text is guaranteed to reach the client before the turn ends.
+        self.reply_to_slash_command(client_id, &session_id, &reply, responder)
+            .await;
+
+        // Inject team context into the live agent (join only).
+        if let Some(context) = inject {
+            self.inject_to_agent(&session_id, context).await;
+        }
+    }
+
+    /// Apply the effects of a parsed slash command against team state, returning
+    /// the user-facing reply and any agent context to inject.
+    async fn apply_slash_command(
+        &mut self,
+        session_id: &str,
+        command: SlashCommand,
+    ) -> (String, Option<String>) {
+        use crate::jamsession_tool::slash;
+
+        match command {
+            SlashCommand::JoinTeam { team } => {
+                if let Err(e) = self.store.join_team(session_id, &team).await {
+                    return (format!("Failed to join team \"{team}\": {e}"), None);
+                }
+                let members = self.store.team_members(&team).await.unwrap_or_default();
+                let reply = format!(
+                    "Joined team \"{team}\". Members: {}.",
+                    if members.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        members.join(", ")
+                    }
+                );
+                let context = slash::join_context(&team, session_id, &members);
+                (reply, Some(context))
+            }
+            SlashCommand::LeaveTeam => match self.store.team_of_session(session_id).await {
+                Ok(Some(team)) => {
+                    if let Err(e) = self.store.leave_team(session_id).await {
+                        return (format!("Failed to leave team: {e}"), None);
+                    }
+                    (format!("Left team \"{team}\"."), None)
+                }
+                Ok(None) => ("You are not on a team.".to_string(), None),
+                Err(e) => (format!("Failed to leave team: {e}"), None),
+            },
+            SlashCommand::Teams => {
+                let teams = self.store.list_teams().await.unwrap_or_default();
+                if teams.is_empty() {
+                    return ("No active teams.".to_string(), None);
+                }
+                let mut lines = vec!["Active teams:".to_string()];
+                for team in teams {
+                    let members = self.store.team_members(&team).await.unwrap_or_default();
+                    lines.push(format!("  {team}: {}", members.join(", ")));
+                }
+                (lines.join("\n"), None)
+            }
+            SlashCommand::Invalid { message } => (message, None),
+        }
+    }
+
+    /// Send the daemon's reply to a slash command back to the client as an
+    /// agent-message notification followed by the terminating prompt response,
+    /// and persist the reply for replay.
+    ///
+    /// The notification and response are handed to the client pipe as a single
+    /// [`SlashReply`] so they are emitted in order on the connection; otherwise
+    /// the response could overtake the notification and the client would see an
+    /// empty turn.
+    async fn reply_to_slash_command(
+        &self,
+        client_id: ClientId,
+        session_id: &str,
+        reply: &str,
+        responder: Responder<PromptResponse>,
+    ) {
+        let notif = SessionNotification::new(
+            AcpSessionId::new(session_id.to_string()),
+            SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                agent_client_protocol::schema::ContentBlock::Text(
+                    agent_client_protocol::schema::TextContent::new(reply),
+                ),
+            )),
+        );
+        let untyped = match notif.to_untyped_message() {
+            Ok(u) => u,
+            Err(e) => {
+                tracing::error!(session_id, error = %e, "failed to encode slash reply");
+                let _ = responder.respond(PromptResponse::new(StopReason::EndTurn));
+                return;
+            }
+        };
+
+        // Persist so the reply replays on reconnect.
+        if let Ok(value) = serde_json::to_value(&untyped)
+            && let Err(e) = self.store.append_message(session_id, &value).await
+        {
+            tracing::error!(session_id, error = %e, "failed to persist slash reply");
+        }
+
+        // Deliver notification + response as an ordered unit via the client pipe.
+        if let Some(client) = self.clients.get(&client_id) {
+            let _ = client.slash_reply_tx.send(SlashReply {
+                notification: untyped,
+                responder,
+            });
+        } else {
+            // Client vanished; still answer the responder so it is not dropped.
+            let _ = responder.respond(PromptResponse::new(StopReason::EndTurn));
+        }
+    }
+
+    /// Reply to a slash command issued before any session exists.
+    ///
+    /// This is effectively unreachable in normal use — a client establishes a
+    /// session before it can prompt — but is handled defensively. There is no
+    /// session id to key a session-scoped `AgentMessageChunk` against, and an
+    /// error response would route into the connection's error handling rather
+    /// than the client's prompt result (leaving it to hang). So we simply end the
+    /// turn; the client gets an empty (but terminating) response rather than a
+    /// hang. `reply` is logged for diagnostics.
+    fn reply_without_session(
+        &self,
+        client_id: ClientId,
+        reply: &str,
+        responder: Responder<PromptResponse>,
+    ) {
+        tracing::warn!(client_id, %reply, "slash command before session established");
+        let _ = responder.respond(PromptResponse::new(StopReason::EndTurn));
+    }
+
+    /// Inject an out-of-band context/message prompt into a live agent.
+    ///
+    /// No-op if the session's agent is not currently alive.
+    async fn inject_to_agent(&self, session_id: &str, text: String) {
+        let Some(session) = self.sessions.get(session_id) else {
+            return;
+        };
+        if let Some(agent) = self.agents.get(&session.agent_id) {
+            let _ = agent.inject_tx.send(text);
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Client disconnect
     // -----------------------------------------------------------------------
 
@@ -476,16 +686,24 @@ impl<'scope> Dispatcher<'scope> {
     // Agent ready
     // -----------------------------------------------------------------------
 
+    #[expect(clippy::too_many_arguments)]
     async fn handle_agent_ready(
         &mut self,
         agent_id: AgentId,
         outgoing_tx: mpsc::UnboundedSender<Dispatch>,
+        inject_tx: mpsc::UnboundedSender<String>,
         session_id: SessionId,
         client_id: ClientId,
         cwd: PathBuf,
         responder: AgentReadyResponder,
     ) {
-        self.agents.insert(agent_id, AgentHandle { outgoing_tx });
+        self.agents.insert(
+            agent_id,
+            AgentHandle {
+                outgoing_tx,
+                inject_tx,
+            },
+        );
         self.agent_to_session.insert(agent_id, session_id.clone());
         self.trace_event(
             Some(session_id.clone()),
@@ -657,6 +875,13 @@ impl<'scope> Dispatcher<'scope> {
             })
             .await
             .if_request(async |req: PromptRequest, responder| {
+                // Intercept `/jamsession:*` slash commands: the daemon handles
+                // them locally and never forwards them to the agent.
+                if let Some(command) = slash_command_of(&req) {
+                    self.handle_slash_command(client_id, req, command, responder)
+                        .await;
+                    return Ok(());
+                }
                 self.persist_user_message(client_id, &req).await;
                 let untyped = req.to_untyped_message().unwrap();
                 let dispatch = Dispatch::Request(untyped, responder.erase_to_json());
@@ -1358,6 +1583,18 @@ impl<'scope> Dispatcher<'scope> {
     }
 }
 
+/// If `req`'s leading text block is a `/jamsession:*` slash command, parse it.
+///
+/// Only the first text block is inspected; that is where a slash command lives.
+fn slash_command_of(req: &PromptRequest) -> Option<crate::jamsession_tool::SlashCommand> {
+    use agent_client_protocol::schema::ContentBlock;
+    let text = req.prompt.iter().find_map(|block| match block {
+        ContentBlock::Text(t) => Some(t.text.as_str()),
+        _ => None,
+    })?;
+    crate::jamsession_tool::slash::parse(text)
+}
+
 fn json_id_to_string(id: &serde_json::Value) -> String {
     match id {
         serde_json::Value::String(s) => s.clone(),
@@ -1376,10 +1613,12 @@ pub(super) async fn client_pipe(
     dispatcher_tx: mpsc::UnboundedSender<DispatcherMessage>,
 ) {
     let (outgoing_tx, outgoing_rx) = mpsc::unbounded_channel::<Dispatch>();
+    let (slash_reply_tx, mut slash_reply_rx) = mpsc::unbounded_channel::<SlashReply>();
 
     let _ = dispatcher_tx.send(DispatcherMessage::ClientRegistered {
         client_id,
         outgoing_tx,
+        slash_reply_tx,
     });
 
     let (read_half, write_half) = stream.into_split();
@@ -1411,8 +1650,31 @@ pub(super) async fn client_pipe(
                 });
                 let mut outgoing =
                     std::pin::pin!(UnboundedReceiverStream::new(outgoing_rx).take_until(eof_fut));
-                while let Some(dispatch) = outgoing.next().await {
-                    cx.send_proxied_message(dispatch)?;
+                // Once the slash-reply channel closes (client handle dropped),
+                // stop selecting on it to avoid busy-looping.
+                let mut slash_open = true;
+                loop {
+                    tokio::select! {
+                        maybe_dispatch = outgoing.next() => {
+                            match maybe_dispatch {
+                                Some(dispatch) => cx.send_proxied_message(dispatch)?,
+                                None => break,
+                            }
+                        }
+                        maybe_reply = slash_reply_rx.recv(), if slash_open => {
+                            match maybe_reply {
+                                Some(SlashReply { notification, responder }) => {
+                                    // Emit the reply text, then end the turn — in
+                                    // this order, on this connection, so the client
+                                    // sees the text before the response.
+                                    let notif: Dispatch = Dispatch::Notification(notification);
+                                    cx.send_proxied_message(notif)?;
+                                    responder.respond(PromptResponse::new(StopReason::EndTurn))?;
+                                }
+                                None => slash_open = false,
+                            }
+                        }
+                    }
                 }
                 Ok(())
             })
@@ -1453,6 +1715,24 @@ struct AgentSpawnRequest {
     default_model: Option<String>,
 }
 
+/// Deliver `text` to the agent as a `session/prompt`, out of band.
+///
+/// Used for daemon-originated context and team messages. The prompt response is
+/// ignored: injection is fire-and-forget, and errors on the response leg would
+/// only reflect agent-side handling, not delivery.
+fn inject_prompt(
+    cx: &agent_client_protocol::ConnectionTo<agent_client_protocol::Agent>,
+    session_id: &str,
+    text: String,
+) -> Result<(), agent_client_protocol::Error> {
+    use agent_client_protocol::schema::{ContentBlock, PromptRequest, TextContent};
+    cx.send_request(PromptRequest::new(
+        AcpSessionId::new(session_id),
+        vec![ContentBlock::Text(TextContent::new(text))],
+    ))
+    .on_receiving_result(async move |_result| Ok(()))
+}
+
 async fn agent_pipe(
     transport: DynConnectTo<Client>,
     dispatcher_tx: mpsc::UnboundedSender<DispatcherMessage>,
@@ -1461,6 +1741,9 @@ async fn agent_pipe(
 ) {
     let agent_id = spawn_request.agent_id;
     let (outgoing_tx, outgoing_rx) = mpsc::unbounded_channel::<Dispatch>();
+    // Out-of-band context/message injection: text sent here becomes a
+    // `session/prompt` to the agent (see the outgoing loop below).
+    let (inject_tx, mut inject_rx) = mpsc::unbounded_channel::<String>();
     let responder_slot: Arc<std::sync::Mutex<Option<AgentReadyResponder>>> =
         Arc::new(std::sync::Mutex::new(Some(responder)));
 
@@ -1478,6 +1761,9 @@ async fn agent_pipe(
                     .block_task()
                     .await?;
 
+                // The session id, captured for the injection loop below.
+                let session_id_for_inject;
+
                 match spawn_request.request {
                     SessionRequest::New {
                         ref cwd,
@@ -1491,6 +1777,7 @@ async fn agent_pipe(
                             .await?;
 
                         let session_id = resp.session_id.0.to_string();
+                        session_id_for_inject = session_id.clone();
 
                         if let Some(ref desired_model) = spawn_request.default_model {
                             set_model_config_option(
@@ -1530,6 +1817,7 @@ async fn agent_pipe(
                         let _ = dispatcher_tx.send(DispatcherMessage::AgentReady {
                             agent_id,
                             outgoing_tx,
+                            inject_tx,
                             session_id,
                             client_id: spawn_request.client_id,
                             cwd: cwd.clone(),
@@ -1541,6 +1829,7 @@ async fn agent_pipe(
                         ref cwd,
                         ref mcp_servers,
                     } => {
+                        session_id_for_inject = session_id.clone();
                         cx.send_request(
                             ResumeSessionRequest::new(AcpSessionId::new(session_id.as_str()), cwd)
                                 .mcp_servers(mcp_servers.clone()),
@@ -1562,6 +1851,7 @@ async fn agent_pipe(
                         let _ = dispatcher_tx.send(DispatcherMessage::AgentReady {
                             agent_id,
                             outgoing_tx,
+                            inject_tx,
                             session_id: session_id.clone(),
                             client_id: spawn_request.client_id,
                             cwd: cwd.clone(),
@@ -1575,8 +1865,25 @@ async fn agent_pipe(
                 });
                 let mut outgoing =
                     std::pin::pin!(UnboundedReceiverStream::new(outgoing_rx).take_until(eof_fut));
-                while let Some(dispatch) = outgoing.next().await {
-                    cx.send_proxied_message(dispatch)?;
+                // Once the injection channel closes (the agent handle was
+                // dropped), stop selecting on it so we don't busy-loop; the
+                // outgoing stream still drives termination.
+                let mut inject_open = true;
+                loop {
+                    tokio::select! {
+                        maybe_dispatch = outgoing.next() => {
+                            match maybe_dispatch {
+                                Some(dispatch) => cx.send_proxied_message(dispatch)?,
+                                None => break,
+                            }
+                        }
+                        maybe_text = inject_rx.recv(), if inject_open => {
+                            match maybe_text {
+                                Some(text) => inject_prompt(&cx, &session_id_for_inject, text)?,
+                                None => inject_open = false,
+                            }
+                        }
+                    }
                 }
                 Ok(())
             }

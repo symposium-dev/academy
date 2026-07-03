@@ -90,12 +90,17 @@ every team command returns `{"error": "not a team member", …}`; unknown comman
 return `{"error": "unknown command …", "hint": …}`. The `help` output is the full
 static command table matching the RFD.
 
+**Status: done.** Implemented as `jamsession_tool/command.rs` with a single
+`COMMANDS` spec table driving both the general help and per-command detail (no
+drift). `dispatch_json` parses and dispatches; malformed known commands return an
+`invalid arguments` error.
+
 **Red (unit):**
 
-- [ ] general `help` returns the full command table
-- [ ] `help` with `subcommand: "send"` returns the detailed `send` docs
-- [ ] an unknown command returns the structured error + hint
-- [ ] a team command (e.g. `send`) returns not-a-member when no team state exists
+- [x] general `help` returns the full command table
+- [x] `help` with `subcommand: "send"` returns the detailed `send` docs
+- [x] an unknown command returns the structured error + hint
+- [x] a team command (e.g. `send`) returns not-a-member when no team state exists
 
 ## Step 2: MCP transport wiring (first, riskiest integration)
 
@@ -113,39 +118,69 @@ Per the **Known limitation** above, the tool can only be attached on the
 therefore wires the `New` path; resumed/respawned agents will regain the tool
 once the mcp-over-acp rework lands.
 
+**Status: done.** The daemon wraps the agent transport (in `handle_session_new`)
+as `ConductorImpl::new_agent(ProxiesAndAgent::new(inner).proxy(tool).proxy(polyfill))`;
+the conductor/polyfill/rmcp deps live in the `jamsession` crate. The tool
+forwards `JamsessionToolCall` over a channel; a forwarder task rewraps it as
+`DispatcherMessage::JamsessionToolCall`. Serving is gated behind
+`Daemon::with_serve_jamsession_tool` (off in the test harness by default).
+
 **Red (integration):**
 
-- [ ] a Rhai script `say(mcp::call_tool("jamsession", "jamsession", #{command:"help"}))`
+- [x] a Rhai script `say(mcp::call_tool("jamsession", "jamsession", #{command:"help"}))`
       returns the help table
-- [ ] unknown-command and not-a-member responses arrive over the real tool path
+- [x] unknown-command and not-a-member responses arrive over the real tool path
 
 ## Step 3: Team persistence (pure DB)
 
 Add toasty models (`Team` + membership) and `Store` methods: `join_team`,
-`leave_team`, `list_teams`, `team_of_session`, `team_members`. The dispatcher
-rehydrates team state into an in-memory cache on startup, mirroring how sessions
-are rehydrated.
+`leave_team`, `list_teams`, `team_of_session`, `team_members`.
+
+**Status: done.** Implemented as a single `TeamMembership` model keyed by
+`session_id`, so the one-team-per-session invariant *is* the primary key and
+teams are implicit (no separate teams table). The Store reads team state
+directly, so no in-memory rehydration cache was needed. `remove_session` now
+also clears membership, and the trace-table migration was generalized to
+`add_missing_tables` (adds any suffix of new tables to an existing database).
 
 **Red (unit, db-level):**
 
-- [ ] join / leave / list transitions
-- [ ] one-team-per-session invariant enforced
-- [ ] team membership survives a daemon restart (file-backed store)
+- [x] join / leave / list transitions
+- [x] one-team-per-session invariant enforced (joining a second team replaces)
+- [x] team membership survives a daemon restart (file-backed store)
+- [x] membership cleared on session removal; migration adds the table to an old db
 
 ## Step 4: Slash commands + injection seam
 
 Intercept `/jamsession:{join-team,leave-team,teams}` in `handle_from_client`:
 update team state, persist the user message and the daemon's reply (for replay),
-respond via a client notification, and do **not** forward to the agent. Advertise
-the commands via a merged `AvailableCommandsUpdate`. On successful join, inject
-the `<context>…now a member…</context>` prompt to the live agent. Introduce the
-per-agent injection channel here.
+respond via a client notification, and do **not** forward to the agent. On
+successful join, inject the `<context>…now a member…</context>` prompt to the
+live agent. Introduce the per-agent injection channel here.
+
+**Status: done.** Pure parsing/rendering lives in `jamsession_tool/slash.rs`;
+the dispatcher supplies effects. The reply is delivered as an `AgentMessageChunk`
+notification followed by `PromptResponse(EndTurn)`. Both are handed to the client
+pipe as one `SlashReply` unit and emitted on the connection in order, so the
+reply text always reaches the client before the turn ends (an earlier version
+sent the notification and response over two queues, which raced — caught in
+review, fixed, and guarded by a multi-threaded regression test). The reply is
+persisted for replay. The injection seam is a per-agent `inject_tx` in
+`AgentHandle`, drained by a `tokio::select!` in `agent_pipe` that turns injected
+text into a `session/prompt` (fire-and-forget). Injecting to a dead agent is a
+silent no-op.
+
+**Deviation:** advertising the commands via a merged `AvailableCommandsUpdate` is
+deferred — the rhaicp mock agent never emits `AvailableCommandsUpdate`, so it is
+untestable in this harness, and its effect is only a client-side command menu.
+Tracked as a follow-up.
 
 **Red (integration):**
 
-- [ ] `/jamsession:join-team foo` produces a daemon reply notification, the agent
-      is **not** prompted, and membership is now true
-- [ ] `/jamsession:teams` lists the active team and members
+- [x] `/jamsession:join-team foo` produces a daemon reply, the agent is **not**
+      prompted with the command, and the join `<context>` is injected into the agent
+- [x] `/jamsession:teams` lists the active team; `leave-team` and invalid commands
+      report appropriately
 
 ## Step 5: Wire team state into dispatch + `list-members`
 
