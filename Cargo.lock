@@ -1701,6 +1701,7 @@ dependencies = [
  "chrono",
  "clap",
  "dirs",
+ "expect-test",
  "futures",
  "lazy_static",
  "libc",

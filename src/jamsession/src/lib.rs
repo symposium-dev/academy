@@ -9,6 +9,7 @@ pub mod debug;
 mod dispatcher;
 mod eof_signal;
 pub mod error;
+pub mod jamsession_tool;
 pub mod logging;
 mod session;
 

@@ -1,0 +1,8 @@
+//! The `jamsession` MCP tool: a single CLI-style tool exposing daemon
+//! capabilities to agents as JSON subcommands.
+//!
+//! The command *logic* lives here, decoupled from the ACP/MCP transport, so it
+//! can be unit-tested without any plumbing. See [`command`] for the command
+//! enum and its dispatch.
+
+pub mod command;

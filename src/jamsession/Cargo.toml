@@ -39,4 +39,5 @@ toasty-driver-sqlite = "0.7.0"
 rust-embed = "8.11.0"
 
 [dev-dependencies]
+expect-test = "1.5.1"
 tempfile = "3"
