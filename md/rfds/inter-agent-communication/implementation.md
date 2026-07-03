@@ -209,12 +209,25 @@ Step-4 seam. Messages for dead recipients are queued in a DB table and flushed o
 the recipient's next session activation. `send` to an unknown or off-team agent
 returns the structured error.
 
+**Status: done.** Message rendering is pure (`jamsession_tool/message.rs`).
+`send`/`broadcast` are side-effecting, so the dispatcher handles them (rather
+than the pure command core): `parse_message_command` extracts them only for an
+on-team caller, and `deliver_team_message` injects to a live recipient or queues
+to the `PendingMessage` table otherwise. `flush_pending_messages` drains the
+queue (in send order) when an agent becomes ready in `handle_agent_ready`.
+
+While building this, the injection seam revealed a latent defect: `inject_prompt`
+sent the prompt via `on_receiving_result`, whose canceled response — which occurs
+when a client disconnects right after triggering an injection — surfaced as a
+connection error and killed the agent. Injection now spawns the request and
+swallows its result, so it is truly fire-and-forget. (This also hardens Step 4's
+join-context injection.)
+
 **Red (integration):**
 
-- [ ] two sessions on one team: A `send`s B; B's script observes the team-message
-      via `receive_prompt()`
-- [ ] `broadcast` reaches all other peers and reports `delivered_to`
-- [ ] a message queued for a dead agent is delivered after it respawns
+- [x] two team members: a broadcast reaches a live peer as a `<team-message>`
+- [x] `broadcast` reports `delivered_to`; `send` to an unknown agent errors
+- [x] a message queued for a dead agent is delivered after it respawns
 
 ## Step 7: Worklist (`post-worklist`, `remove-worklist`, `show-worklist`)
 

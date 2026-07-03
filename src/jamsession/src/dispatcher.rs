@@ -442,9 +442,76 @@ impl<'scope> Dispatcher<'scope> {
         .await;
 
         let ctx = self.team_context_for(session_id.as_deref()).await;
-        let response = jamsession_tool::dispatch_json(input, &ctx);
+
+        // Side-effecting team commands (send/broadcast) are handled here in the
+        // dispatcher, since they inject into *other* agents and queue to the DB.
+        // Everything else is answered by the pure command dispatch.
+        let response = match parse_message_command(&input, &ctx) {
+            Some(MessageCommand::Send { to, message }) => {
+                self.handle_send(&ctx, &to, &message).await
+            }
+            Some(MessageCommand::Broadcast { message }) => {
+                self.handle_broadcast(&ctx, &message).await
+            }
+            None => jamsession_tool::dispatch_json(input, &ctx),
+        };
         // The agent may have gone away before we could answer; that is benign.
         let _ = respond.send(response);
+    }
+
+    /// Handle `send`: deliver a direct message to one team member.
+    async fn handle_send(
+        &self,
+        ctx: &jamsession_tool::TeamContext,
+        to: &str,
+        message: &str,
+    ) -> serde_json::Value {
+        use jamsession_tool::{MessageKind, team_message};
+
+        // Recipient must be a member of the caller's team (and not the caller).
+        let is_member = ctx.members.iter().any(|m| m.id == to);
+        if !is_member || to == ctx.me {
+            return serde_json::json!({ "error": "unknown agent", "agent": to });
+        }
+
+        let text = team_message(&ctx.me, MessageKind::Direct, message);
+        self.deliver_team_message(to, text).await;
+        serde_json::json!({ "delivered": true })
+    }
+
+    /// Handle `broadcast`: deliver a message to all other team members.
+    async fn handle_broadcast(
+        &self,
+        ctx: &jamsession_tool::TeamContext,
+        message: &str,
+    ) -> serde_json::Value {
+        use jamsession_tool::{MessageKind, team_message};
+
+        let text = team_message(&ctx.me, MessageKind::Broadcast, message);
+        let mut delivered_to = Vec::new();
+        for member in &ctx.members {
+            if member.id == ctx.me {
+                continue;
+            }
+            self.deliver_team_message(&member.id, text.clone()).await;
+            delivered_to.push(member.id.clone());
+        }
+        serde_json::json!({ "delivered_to": delivered_to })
+    }
+
+    /// Deliver a rendered team message to `recipient_session_id`: inject it into
+    /// the live agent if one is backing the session, else queue it for delivery
+    /// when the agent next becomes ready.
+    async fn deliver_team_message(&self, recipient_session_id: &str, text: String) {
+        if self.session_has_live_agent(recipient_session_id) {
+            self.inject_to_agent(recipient_session_id, text).await;
+        } else if let Err(e) = self.store.queue_message(recipient_session_id, &text).await {
+            tracing::error!(
+                recipient = recipient_session_id,
+                error = %e,
+                "failed to queue team message"
+            );
+        }
     }
 
     /// Resolve the [`TeamContext`] for the agent owning `session_id`.
@@ -469,7 +536,16 @@ impl<'scope> Dispatcher<'scope> {
             return TeamContext::none(session_id);
         };
 
-        let member_ids = self.store.team_members(&team).await.unwrap_or_default();
+        let member_ids = match self.store.team_members(&team).await {
+            Ok(ids) => ids,
+            Err(e) => {
+                // Log rather than silently returning an empty roster: the caller
+                // is on `team`, so an empty roster would be a plausible-but-wrong
+                // success that omits even the caller itself.
+                tracing::error!(session_id, team, error = %e, "failed to read team roster");
+                Vec::new()
+            }
+        };
         let mut members = Vec::with_capacity(member_ids.len());
         for id in member_ids {
             let working_dir = self
@@ -683,6 +759,21 @@ impl<'scope> Dispatcher<'scope> {
         }
     }
 
+    /// Deliver any team messages queued for `session_id` while its agent was not
+    /// live, injecting them in send order. Called when the agent becomes ready.
+    async fn flush_pending_messages(&self, session_id: &str) {
+        let pending = match self.store.take_pending_messages(session_id).await {
+            Ok(pending) => pending,
+            Err(e) => {
+                tracing::error!(session_id, error = %e, "failed to read pending messages");
+                return;
+            }
+        };
+        for text in pending {
+            self.inject_to_agent(session_id, text).await;
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Client disconnect
     // -----------------------------------------------------------------------
@@ -812,6 +903,10 @@ impl<'scope> Dispatcher<'scope> {
         }
 
         self.client_to_session.insert(client_id, session_id.clone());
+
+        // Flush any team messages that were queued while this session's agent
+        // was not live, now that it is ready to receive them.
+        self.flush_pending_messages(&session_id).await;
 
         match responder {
             AgentReadyResponder::NewSession(r) => {
@@ -1644,6 +1739,36 @@ impl<'scope> Dispatcher<'scope> {
     }
 }
 
+/// A side-effecting team message command that the dispatcher (not the pure
+/// command core) must handle.
+enum MessageCommand {
+    Send { to: String, message: String },
+    Broadcast { message: String },
+}
+
+/// Extract a side-effecting `send`/`broadcast` from the raw tool input, but only
+/// when the caller is on a team.
+///
+/// Off-team callers return `None` so the request flows to the pure dispatch,
+/// which reports not-a-member. Malformed input also returns `None`, so the pure
+/// dispatch produces the invalid-arguments error (single source of truth for
+/// that message).
+fn parse_message_command(
+    input: &serde_json::Value,
+    ctx: &jamsession_tool::TeamContext,
+) -> Option<MessageCommand> {
+    ctx.team.as_ref()?;
+    match serde_json::from_value::<jamsession_tool::JamsessionCommand>(input.clone()) {
+        Ok(jamsession_tool::JamsessionCommand::Send { to, message }) => {
+            Some(MessageCommand::Send { to, message })
+        }
+        Ok(jamsession_tool::JamsessionCommand::Broadcast { message }) => {
+            Some(MessageCommand::Broadcast { message })
+        }
+        _ => None,
+    }
+}
+
 /// If `req`'s leading text block is a `/jamsession:*` slash command, parse it.
 ///
 /// Only the first text block is inspected; that is where a slash command lives.
@@ -1787,11 +1912,19 @@ fn inject_prompt(
     text: String,
 ) -> Result<(), agent_client_protocol::Error> {
     use agent_client_protocol::schema::{ContentBlock, PromptRequest, TextContent};
-    cx.send_request(PromptRequest::new(
+
+    // Send the prompt on a spawned task and swallow its result. Injection is
+    // fire-and-forget: we do not want a canceled response (which happens when
+    // the connection is torn down before the agent replies, e.g. right after a
+    // client disconnects) to surface as a connection error and kill the agent.
+    let sent = cx.send_request(PromptRequest::new(
         AcpSessionId::new(session_id),
         vec![ContentBlock::Text(TextContent::new(text))],
-    ))
-    .on_receiving_result(async move |_result| Ok(()))
+    ));
+    cx.spawn(async move {
+        let _ = sent.block_task().await;
+        Ok(())
+    })
 }
 
 async fn agent_pipe(

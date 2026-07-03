@@ -6,9 +6,11 @@
 //! enum and its dispatch.
 
 pub mod command;
+pub mod message;
 pub mod slash;
 pub mod tool;
 
-pub use command::{MemberInfo, TeamContext, dispatch_json};
+pub use command::{JamsessionCommand, MemberInfo, TeamContext, dispatch_json};
+pub use message::{MessageKind, team_message};
 pub use slash::SlashCommand;
 pub use tool::{JamsessionTool, JamsessionToolCall, ToolCallSender};

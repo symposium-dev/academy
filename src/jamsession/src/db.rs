@@ -68,6 +68,25 @@ pub struct TeamMembership {
     pub joined_at: String,
 }
 
+/// A team message queued for a session whose agent was not live at send time.
+///
+/// Delivered (and deleted) when the recipient's agent next becomes ready. The
+/// auto-increment `id` preserves send order within a recipient.
+#[derive(Debug, toasty::Model)]
+pub struct PendingMessage {
+    #[key]
+    #[auto]
+    pub id: u64,
+
+    #[index]
+    pub session_id: String,
+
+    /// The fully-rendered message text to inject into the recipient's turn.
+    pub body: String,
+
+    pub queued_at: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionRecord {
     pub session_id: String,
@@ -141,7 +160,13 @@ impl Store {
         }
 
         let db = toasty::Db::builder()
-            .models(toasty::models!(Session, Message, Trace, TeamMembership))
+            .models(toasty::models!(
+                Session,
+                Message,
+                Trace,
+                TeamMembership,
+                PendingMessage
+            ))
             .build(toasty_driver_sqlite::Sqlite::open(path))
             .await?;
 
@@ -154,7 +179,7 @@ impl Store {
             // created. These are always a suffix of the registered models
             // (tables are only ever appended), so they can be added together.
             let mut missing = Vec::new();
-            for table in ["traces", "team_memberships"] {
+            for table in ["traces", "team_memberships", "pending_messages"] {
                 if !table_exists(&db, table).await? {
                     missing.push(table);
                 }
@@ -169,7 +194,13 @@ impl Store {
 
     pub async fn in_memory() -> crate::error::Result<Self> {
         let db = toasty::Db::builder()
-            .models(toasty::models!(Session, Message, Trace, TeamMembership))
+            .models(toasty::models!(
+                Session,
+                Message,
+                Trace,
+                TeamMembership,
+                PendingMessage
+            ))
             .build(toasty_driver_sqlite::Sqlite::in_memory())
             .await?;
         db.push_schema().await?;
@@ -273,6 +304,10 @@ impl Store {
             .delete()
             .exec(&mut db)
             .await?;
+        PendingMessage::filter(PendingMessage::fields().session_id().eq(session_id))
+            .delete()
+            .exec(&mut db)
+            .await?;
         Session::filter(Session::fields().id().eq(session_id))
             .delete()
             .exec(&mut db)
@@ -357,6 +392,47 @@ impl Store {
         teams.sort();
         teams.dedup();
         Ok(teams)
+    }
+
+    // -----------------------------------------------------------------------
+    // Pending team messages
+    // -----------------------------------------------------------------------
+
+    /// Queue a rendered team message for `session_id`, to be delivered when its
+    /// agent is next live.
+    pub async fn queue_message(&self, session_id: &str, body: &str) -> crate::error::Result<()> {
+        let mut db = self.db.clone();
+        toasty::create!(PendingMessage {
+            session_id: session_id.to_string(),
+            body: body.to_string(),
+            queued_at: Utc::now().to_rfc3339(),
+        })
+        .exec(&mut db)
+        .await?;
+        Ok(())
+    }
+
+    /// Remove and return all pending messages for `session_id`, in send order.
+    pub async fn take_pending_messages(
+        &self,
+        session_id: &str,
+    ) -> crate::error::Result<Vec<String>> {
+        let mut db = self.db.clone();
+        let pending = PendingMessage::filter(PendingMessage::fields().session_id().eq(session_id))
+            .order_by(PendingMessage::fields().id().asc())
+            .exec(&mut db)
+            .await?;
+
+        let bodies: Vec<String> = pending.into_iter().map(|m| m.body).collect();
+
+        if !bodies.is_empty() {
+            PendingMessage::filter(PendingMessage::fields().session_id().eq(session_id))
+                .delete()
+                .exec(&mut db)
+                .await?;
+        }
+
+        Ok(bodies)
     }
 
     pub async fn record_trace(&self, trace: NewTrace) -> crate::error::Result<()> {
@@ -821,6 +897,50 @@ mod tests {
         assert_eq!(
             store.team_of_session("a").await.unwrap().as_deref(),
             Some("frontend")
+        );
+    }
+
+    #[tokio::test]
+    async fn queue_and_take_pending_messages_in_order() {
+        let store = Store::in_memory().await.unwrap();
+
+        assert!(store.take_pending_messages("a").await.unwrap().is_empty());
+
+        store.queue_message("a", "first").await.unwrap();
+        store.queue_message("a", "second").await.unwrap();
+        store.queue_message("b", "other").await.unwrap();
+
+        // Draining "a" returns its messages in send order and removes them.
+        assert_eq!(
+            store.take_pending_messages("a").await.unwrap(),
+            vec!["first".to_string(), "second".to_string()]
+        );
+        assert!(store.take_pending_messages("a").await.unwrap().is_empty());
+
+        // "b" is unaffected by draining "a".
+        assert_eq!(
+            store.take_pending_messages("b").await.unwrap(),
+            vec!["other".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_session_clears_pending_messages() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(&dir.path().join("jamsession.db"))
+            .await
+            .unwrap();
+        store.add_session("sess-1", dir.path()).await.unwrap();
+        store.queue_message("sess-1", "hi").await.unwrap();
+
+        store.remove_session("sess-1").await.unwrap();
+
+        assert!(
+            store
+                .take_pending_messages("sess-1")
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 }
