@@ -10,7 +10,7 @@ RFD then proposes a specific, reviewable *delta* drawn from this section and tak
 implementation. So this section runs ahead of the code: today it mostly describes what already
 exists, but that is just where the worked-out design happens to reach so far, not a limit on
 what belongs here. Forward-looking design is welcome — what matters is that a reader can tell
-built from planned (the [Build-Out Roadmap](./roadmap.md) carries that status; see
+built from planned (the [Build-Out Roadmap](../implementation/roadmap.md) carries that status; see
 [Maintaining this book](../contributing/maintaining-the-docs.md) for the update contract).
 
 ## How to read these docs

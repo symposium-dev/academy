@@ -3,12 +3,12 @@
 This page is the authoritative **done / in-flight / planned** status surface for
 Jamsession's build-out. It is a **rollup**: it adds the one view no single RFD has — how the
 work groups fit together (sequencing, dependencies), what is built versus still planned, and
-which [architecture decisions](./decisions.md) each group realizes or must honor.
+which [architecture decisions](../design/decisions.md) each group realizes or must honor.
 
 It deliberately does **not** duplicate:
 
 - **Per-step status** — that lives in each RFD's `implementation.md` checkboxes.
-- **Design rationale and alternatives** — those live in the [architecture pages](./README.md)
+- **Design rationale and alternatives** — those live in the [architecture pages](../design/README.md)
   and the RFD `README.md`s.
 
 Each entry links out to those instead of restating them. When this page and a linked page
@@ -40,12 +40,12 @@ Nothing more.
 
 | Task group | Status | RFD | Realizes / honors | Depends on |
 |---|---|---|---|---|
-| Single-writer dispatcher core | Done | *(pre-RFD foundation)* | [D1](./decisions.md#d1--single-writer-dispatcher), [D2](./decisions.md#d2--timers-as-messages-invalidated-by-a-generation-counter), [D5](./decisions.md#d5--the-daemon-is-the-sole-acp-endpoint) | — |
+| Single-writer dispatcher core | Done | *(pre-RFD foundation)* | [D1](../design/decisions.md#d1--single-writer-dispatcher), [D2](../design/decisions.md#d2--timers-as-messages-invalidated-by-a-generation-counter), [D5](../design/decisions.md#d5--the-daemon-is-the-sole-acp-endpoint) | — |
 | RFD process | Done | [rfd-process](../rfds/rfd-process/README.md) | — | — |
-| Session persistence | Done | [session-persistence](../rfds/session-persistence/README.md) | [D3](./decisions.md#d3--ephemeral-agents-the-daemon-owns-and-replays-history), [D6](./decisions.md#d6--persistence-is-sqlite-via-toasty) | Dispatcher core |
-| Message trace & debug viewer | Done | [message-trace](../rfds/message-trace/README.md) | honors [D1](./decisions.md#d1--single-writer-dispatcher) | Dispatcher core |
-| `jamsession` MCP tool | Done | [jamsession-tool](../rfds/inter-agent-communication/jamsession-tool/README.md) | honors [D5](./decisions.md#d5--the-daemon-is-the-sole-acp-endpoint) | Dispatcher core |
-| Inter-agent communication | Done | [inter-agent-communication](../rfds/inter-agent-communication/README.md) | [D4](./decisions.md#d4--an-agents-identity-is-its-session-id), [D7](./decisions.md#d7--a-session-belongs-to-at-most-one-team) | Session persistence, `jamsession` MCP tool |
+| Session persistence | Done | [session-persistence](../rfds/session-persistence/README.md) | [D3](../design/decisions.md#d3--ephemeral-agents-the-daemon-owns-and-replays-history), [D6](../design/decisions.md#d6--persistence-is-sqlite-via-toasty) | Dispatcher core |
+| Message trace & debug viewer | Done | [message-trace](../rfds/message-trace/README.md) | honors [D1](../design/decisions.md#d1--single-writer-dispatcher) | Dispatcher core |
+| `jamsession` MCP tool | Done | [jamsession-tool](../rfds/inter-agent-communication/jamsession-tool/README.md) | honors [D5](../design/decisions.md#d5--the-daemon-is-the-sole-acp-endpoint) | Dispatcher core |
+| Inter-agent communication | Done | [inter-agent-communication](../rfds/inter-agent-communication/README.md) | [D4](../design/decisions.md#d4--an-agents-identity-is-its-session-id), [D7](../design/decisions.md#d7--a-session-belongs-to-at-most-one-team) | Session persistence, `jamsession` MCP tool |
 
 ## Core (built)
 
@@ -55,10 +55,10 @@ The foundation the rest of the system is built on, plus the features that have s
 
 - **Scope:** The actor that owns all session state and serializes every change through one
   message loop; the daemon's routing, lifecycle, and timer machinery.
-- **RFD:** *(pre-RFD foundation)* — design in [Architecture & Design](./README.md).
-- **Realizes:** [D1](./decisions.md#d1--single-writer-dispatcher),
-  [D2](./decisions.md#d2--timers-as-messages-invalidated-by-a-generation-counter),
-  [D5](./decisions.md#d5--the-daemon-is-the-sole-acp-endpoint).
+- **RFD:** *(pre-RFD foundation)* — design in [Architecture & Design](../design/README.md).
+- **Realizes:** [D1](../design/decisions.md#d1--single-writer-dispatcher),
+  [D2](../design/decisions.md#d2--timers-as-messages-invalidated-by-a-generation-counter),
+  [D5](../design/decisions.md#d5--the-daemon-is-the-sole-acp-endpoint).
 - **Depends on:** —
 
 ### RFD process — Done
@@ -76,8 +76,8 @@ The foundation the rest of the system is built on, plus the features that have s
   survive daemon restarts and agent respawns.
 - **RFD:** [session-persistence](../rfds/session-persistence/README.md) (completed) ·
   steps: [implementation.md](../rfds/session-persistence/implementation.md).
-- **Realizes:** [D3](./decisions.md#d3--ephemeral-agents-the-daemon-owns-and-replays-history),
-  [D6](./decisions.md#d6--persistence-is-sqlite-via-toasty).
+- **Realizes:** [D3](../design/decisions.md#d3--ephemeral-agents-the-daemon-owns-and-replays-history),
+  [D6](../design/decisions.md#d6--persistence-is-sqlite-via-toasty).
 - **Depends on:** Single-writer dispatcher core.
 
 ### Message trace & debug viewer — Done
@@ -86,7 +86,7 @@ The foundation the rest of the system is built on, plus the features that have s
   viewer for inspecting them.
 - **RFD:** [message-trace](../rfds/message-trace/README.md) (completed) ·
   steps: [implementation.md](../rfds/message-trace/implementation.md).
-- **Realizes:** honors [D1](./decisions.md#d1--single-writer-dispatcher) (responses routed
+- **Realizes:** honors [D1](../design/decisions.md#d1--single-writer-dispatcher) (responses routed
   back through the actor loop for canonical trace ordering).
 - **Depends on:** Single-writer dispatcher core.
 
@@ -96,7 +96,7 @@ The foundation the rest of the system is built on, plus the features that have s
   subcommands — the delivery vehicle for inter-agent features.
 - **RFD:** [jamsession-tool](../rfds/inter-agent-communication/jamsession-tool/README.md)
   (completed, sub-RFD of inter-agent communication).
-- **Realizes:** honors [D5](./decisions.md#d5--the-daemon-is-the-sole-acp-endpoint).
+- **Realizes:** honors [D5](../design/decisions.md#d5--the-daemon-is-the-sole-acp-endpoint).
 - **Depends on:** Single-writer dispatcher core.
 
 ### Inter-agent communication — Done
@@ -105,8 +105,8 @@ The foundation the rest of the system is built on, plus the features that have s
   shared key-value store, with human-controlled team membership.
 - **RFD:** [inter-agent-communication](../rfds/inter-agent-communication/README.md) ·
   steps: [implementation.md](../rfds/inter-agent-communication/implementation.md).
-- **Realizes:** [D4](./decisions.md#d4--an-agents-identity-is-its-session-id),
-  [D7](./decisions.md#d7--a-session-belongs-to-at-most-one-team).
+- **Realizes:** [D4](../design/decisions.md#d4--an-agents-identity-is-its-session-id),
+  [D7](../design/decisions.md#d7--a-session-belongs-to-at-most-one-team).
 - **Depends on:** Session persistence, `jamsession` MCP tool.
 
 ## In flight
@@ -116,7 +116,7 @@ _Nothing in flight — all accepted work is complete._
 ## Planned
 
 _No planned task groups yet. Work out forward-looking design in the
-[Architecture & Design](./README.md) section first, then record its status here._
+[Architecture & Design](../design/README.md) section first, then record its status here._
 
 <!-- Template for a planned task group — copy, fill, and move to a status section as it
      progresses:
@@ -125,7 +125,7 @@ _No planned task groups yet. Work out forward-looking design in the
 
 - **Scope:** <one line: the capability, not the design>
 - **RFD:** <link to the RFD README if one exists, else `none yet — design in
-  [<page>](./<page>.md)`>
+  [<page>](../design/<page>.md)`>
 - **Realizes / honors:** <D-codes it will realize, plus cross-cutting D-codes it must honor,
   or `—`>
 - **Depends on:** <task-group name(s) that must land first, or `—`>

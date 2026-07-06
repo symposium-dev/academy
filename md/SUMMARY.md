@@ -11,7 +11,6 @@
 # Architecture & Design
 
 - [Overview](./design/README.md)
-  - [Build-Out Roadmap](./design/roadmap.md)
   - [Architecture decisions](./design/decisions.md)
   - [Key sequence diagrams](./design/sequence_diagrams.md)
     - [Flow: new session](./design/flow-new-session.md)
@@ -39,6 +38,10 @@
     - [Implementation plan and status](./rfds/session-persistence/implementation.md)
   - [Message trace & debug viewer](./rfds/message-trace/README.md)
     - [Implementation plan and status](./rfds/message-trace/implementation.md)
+
+# Implementation
+
+- [Build-Out Roadmap](./implementation/roadmap.md)
 
 # Contributing
 

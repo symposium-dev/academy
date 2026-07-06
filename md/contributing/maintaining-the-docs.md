@@ -51,12 +51,12 @@ When one of these happens, update the matching page(s) before you consider the w
 | We work out (or revise) how part of the system *should* be designed | The relevant [architecture](../design/README.md) page — capture the intended design, marking anything not yet built as planned |
 | A worked-out design is ready to build | Open an **RFD** (`md/rfds/<name>/`) per the [RFD process](../rfds/README.md) carving out the delta; track steps in its `implementation.md` |
 | An RFD's implementation step lands | Tick the step in that RFD's `implementation.md` — this is the only place per-step status lives; do **not** touch the roadmap |
-| An RFD is accepted (merged, in progress) | Move it to *Accepted* in [`SUMMARY.md`](../SUMMARY.md) and [`accepted.md`](../rfds/accepted.md); flip its group to **In flight** in the [Build-Out Roadmap](../design/roadmap.md) |
-| An RFD completes | Move it to *Completed* in [`SUMMARY.md`](../SUMMARY.md) and [`completed.md`](../rfds/completed.md); update the relevant [architecture](../design/README.md) page; flip its group to **Done** in the [Build-Out Roadmap](../design/roadmap.md) |
+| An RFD is accepted (merged, in progress) | Move it to *Accepted* in [`SUMMARY.md`](../SUMMARY.md) and [`accepted.md`](../rfds/accepted.md); flip its group to **In flight** in the [Build-Out Roadmap](../implementation/roadmap.md) |
+| An RFD completes | Move it to *Completed* in [`SUMMARY.md`](../SUMMARY.md) and [`completed.md`](../rfds/completed.md); update the relevant [architecture](../design/README.md) page; flip its group to **Done** in the [Build-Out Roadmap](../implementation/roadmap.md) |
 | Observable behavior changes / something ships | The relevant [architecture](../design/README.md) page (reconcile it with what now exists) |
 | A new subsystem, flow, or mechanism is built | Add/update the matching [architecture](../design/README.md) page or flow diagram |
 | A new module, or a change in how modules relate | The **Module map** in [architecture](../design/README.md) |
-| Forward-looking work is added to the architecture (design ahead of any RFD), or a cross-group dependency or ordering changes | Add/update the group entry in the [Build-Out Roadmap](../design/roadmap.md) (status, dependencies, sequencing) — the only place cross-RFD ordering lives |
+| Forward-looking work is added to the architecture (design ahead of any RFD), or a cross-group dependency or ordering changes | Add/update the group entry in the [Build-Out Roadmap](../implementation/roadmap.md) (status, dependencies, sequencing) — the only place cross-RFD ordering lives |
 | A cross-cutting, load-bearing decision is made or changed | Add/update an entry in [Architecture decisions](../design/decisions.md) with a new `D<n>` code; a feature-local decision stays in its RFD and is linked from there |
 | A new term worth defining | [`terminology.md`](../terminology.md) |
 | Any new page | Register it in [`SUMMARY.md`](../SUMMARY.md) — a page not listed there does not render |
