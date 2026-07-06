@@ -2,7 +2,9 @@
 
 This page indexes the **load-bearing decisions** behind Jamsession's design — the choices that
 cut across the whole system and constrain everything built on top of them. Each has a stable
-code (`D1`, `D2`, …) so other pages, RFDs, and code comments can reference it.
+code (`D1`, `D2`, …) so other docs and RFDs can point to it without restating it. The codes are
+a documentation handle only — there is no need to tag the code with them; a comment may cite a
+`D<n>` where it genuinely helps a reader, but that is optional, not expected.
 
 Treat these as invariants: an agent working in the codebase should not quietly violate one.
 If a decision genuinely needs to change, that is itself a design change — work it through the
