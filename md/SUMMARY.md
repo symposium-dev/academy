@@ -11,6 +11,7 @@
 # Architecture & Design
 
 - [Overview](./design/README.md)
+  - [Build-Out Roadmap](./design/roadmap.md)
   - [Architecture decisions](./design/decisions.md)
   - [Key sequence diagrams](./design/sequence_diagrams.md)
     - [Flow: new session](./design/flow-new-session.md)
