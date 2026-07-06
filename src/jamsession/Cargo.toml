@@ -37,6 +37,11 @@ libc = "0.2.186"
 toasty = { version = "0.7.0", features = ["migration", "serde"] }
 toasty-driver-sqlite = "0.7.0"
 rust-embed = "8.11.0"
+agent-client-protocol-conductor = "0.13.1"
+agent-client-protocol-polyfill = "0.13.1"
+agent-client-protocol-rmcp = "0.13.1"
+schemars = "1"
 
 [dev-dependencies]
+expect-test = "1.5.1"
 tempfile = "3"

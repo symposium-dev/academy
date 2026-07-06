@@ -138,6 +138,11 @@ pub struct TestDaemonConfig {
     pub agent_script: String,
     pub prior_sessions: Vec<PriorSession>,
     pub crash_after: Option<Duration>,
+    /// Whether the daemon should serve the `jamsession` MCP tool to agents.
+    ///
+    /// Off by default so lifecycle/flow tests see an unwrapped agent transport.
+    /// Tests exercising the tool set this to `true`.
+    pub serve_jamsession_tool: bool,
 }
 
 impl Default for TestDaemonConfig {
@@ -147,6 +152,7 @@ impl Default for TestDaemonConfig {
             agent_script: String::new(),
             prior_sessions: Vec::new(),
             crash_after: None,
+            serve_jamsession_tool: false,
         }
     }
 }
@@ -181,6 +187,7 @@ impl TestDaemon {
             }
         };
         let idle_timeout = config.idle_timeout;
+        let serve_jamsession_tool = config.serve_jamsession_tool;
         let shutdown_token = CancellationToken::new();
 
         let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
@@ -193,6 +200,7 @@ impl TestDaemon {
                 .with_idle_timeout(idle_timeout)
                 .with_quiescence_timeout(Duration::from_millis(10))
                 .with_send_guidelines(false)
+                .with_serve_jamsession_tool(serve_jamsession_tool)
                 .with_lifecycle_events(lifecycle_tx)
                 .with_shutdown_token(daemon_shutdown);
             daemon.run().await

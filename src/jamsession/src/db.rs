@@ -51,6 +51,81 @@ pub struct Trace {
     pub payload: toasty::Json<serde_json::Value>,
 }
 
+/// A session's membership in a jamsession team.
+///
+/// Keyed by `session_id`, so a session belongs to at most one team — the
+/// one-team-per-session invariant is the primary key. A team "exists" exactly
+/// when at least one membership row references it; there is no separate teams
+/// table.
+#[derive(Debug, toasty::Model)]
+pub struct TeamMembership {
+    #[key]
+    pub session_id: String,
+
+    #[index]
+    pub team: String,
+
+    pub joined_at: String,
+}
+
+/// A team message queued for a session whose agent was not live at send time.
+///
+/// Delivered (and deleted) when the recipient's agent next becomes ready. The
+/// auto-increment `id` preserves send order within a recipient.
+#[derive(Debug, toasty::Model)]
+pub struct PendingMessage {
+    #[key]
+    #[auto]
+    pub id: u64,
+
+    #[index]
+    pub session_id: String,
+
+    /// The fully-rendered message text to inject into the recipient's turn.
+    pub body: String,
+
+    pub queued_at: String,
+}
+
+/// An item on a team's shared worklist.
+///
+/// Scoped by `team` (shared across the team's members). The public item id is
+/// rendered as `wl-<id>` from the auto-increment `id`.
+#[derive(Debug, toasty::Model)]
+pub struct WorklistItem {
+    #[key]
+    #[auto]
+    pub id: u64,
+
+    #[index]
+    pub team: String,
+
+    pub item: String,
+    /// The session id of the member who posted the item.
+    pub posted_by: String,
+    pub posted_at: String,
+}
+
+/// A key-value entry in a team's shared store.
+///
+/// Scoped by `team`; `key` is unique within a team. The value is JSON-encoded.
+#[derive(Debug, toasty::Model)]
+pub struct StoreEntry {
+    #[key]
+    #[auto]
+    pub id: u64,
+
+    #[index]
+    pub team: String,
+
+    #[index]
+    pub key: String,
+
+    /// The JSON-encoded value.
+    pub value: String,
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionRecord {
     pub session_id: String,
@@ -124,7 +199,15 @@ impl Store {
         }
 
         let db = toasty::Db::builder()
-            .models(toasty::models!(Session, Message, Trace))
+            .models(toasty::models!(
+                Session,
+                Message,
+                Trace,
+                TeamMembership,
+                PendingMessage,
+                WorklistItem,
+                StoreEntry
+            ))
             .build(toasty_driver_sqlite::Sqlite::open(path))
             .await?;
 
@@ -132,8 +215,25 @@ impl Store {
 
         if !table_exists(&db, "sessions").await? {
             db.push_schema().await?;
-        } else if !table_exists(&db, "traces").await? {
-            create_trace_schema(&db).await?;
+        } else {
+            // Existing database: add any tables introduced after it was
+            // created. These are always a suffix of the registered models
+            // (tables are only ever appended), so they can be added together.
+            let mut missing = Vec::new();
+            for table in [
+                "traces",
+                "team_memberships",
+                "pending_messages",
+                "worklist_items",
+                "store_entries",
+            ] {
+                if !table_exists(&db, table).await? {
+                    missing.push(table);
+                }
+            }
+            if !missing.is_empty() {
+                add_missing_tables(&db, &missing).await?;
+            }
         }
 
         Ok(Self { db })
@@ -141,7 +241,15 @@ impl Store {
 
     pub async fn in_memory() -> crate::error::Result<Self> {
         let db = toasty::Db::builder()
-            .models(toasty::models!(Session, Message, Trace))
+            .models(toasty::models!(
+                Session,
+                Message,
+                Trace,
+                TeamMembership,
+                PendingMessage,
+                WorklistItem,
+                StoreEntry
+            ))
             .build(toasty_driver_sqlite::Sqlite::in_memory())
             .await?;
         db.push_schema().await?;
@@ -241,12 +349,266 @@ impl Store {
             .delete()
             .exec(&mut db)
             .await?;
+        TeamMembership::filter(TeamMembership::fields().session_id().eq(session_id))
+            .delete()
+            .exec(&mut db)
+            .await?;
+        PendingMessage::filter(PendingMessage::fields().session_id().eq(session_id))
+            .delete()
+            .exec(&mut db)
+            .await?;
         Session::filter(Session::fields().id().eq(session_id))
             .delete()
             .exec(&mut db)
             .await?;
 
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Team membership
+    // -----------------------------------------------------------------------
+
+    /// Join `session_id` to `team`, creating the team if it is new.
+    ///
+    /// A session belongs to at most one team, so joining replaces any previous
+    /// membership for that session.
+    pub async fn join_team(&self, session_id: &str, team: &str) -> crate::error::Result<()> {
+        let mut db = self.db.clone();
+
+        // Replace any existing membership (one team per session).
+        TeamMembership::filter(TeamMembership::fields().session_id().eq(session_id))
+            .delete()
+            .exec(&mut db)
+            .await?;
+
+        toasty::create!(TeamMembership {
+            session_id: session_id.to_string(),
+            team: team.to_string(),
+            joined_at: Utc::now().to_rfc3339(),
+        })
+        .exec(&mut db)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Remove `session_id` from whatever team it is on, if any.
+    pub async fn leave_team(&self, session_id: &str) -> crate::error::Result<()> {
+        let mut db = self.db.clone();
+        TeamMembership::filter(TeamMembership::fields().session_id().eq(session_id))
+            .delete()
+            .exec(&mut db)
+            .await?;
+        Ok(())
+    }
+
+    /// The team `session_id` currently belongs to, or `None`.
+    pub async fn team_of_session(&self, session_id: &str) -> crate::error::Result<Option<String>> {
+        let mut db = self.db.clone();
+        let membership =
+            TeamMembership::filter(TeamMembership::fields().session_id().eq(session_id))
+                .exec(&mut db)
+                .await?
+                .into_iter()
+                .next();
+        Ok(membership.map(|m| m.team))
+    }
+
+    /// The session ids of every member of `team`, in ascending id order.
+    pub async fn team_members(&self, team: &str) -> crate::error::Result<Vec<String>> {
+        let mut db = self.db.clone();
+        let mut members: Vec<String> =
+            TeamMembership::filter(TeamMembership::fields().team().eq(team))
+                .exec(&mut db)
+                .await?
+                .into_iter()
+                .map(|m| m.session_id)
+                .collect();
+        members.sort();
+        Ok(members)
+    }
+
+    /// The names of all active teams (those with at least one member), sorted.
+    pub async fn list_teams(&self) -> crate::error::Result<Vec<String>> {
+        let mut db = self.db.clone();
+        let mut teams: Vec<String> = Query::<List<TeamMembership>>::all()
+            .exec(&mut db)
+            .await?
+            .into_iter()
+            .map(|m| m.team)
+            .collect();
+        teams.sort();
+        teams.dedup();
+        Ok(teams)
+    }
+
+    // -----------------------------------------------------------------------
+    // Pending team messages
+    // -----------------------------------------------------------------------
+
+    /// Queue a rendered team message for `session_id`, to be delivered when its
+    /// agent is next live.
+    pub async fn queue_message(&self, session_id: &str, body: &str) -> crate::error::Result<()> {
+        let mut db = self.db.clone();
+        toasty::create!(PendingMessage {
+            session_id: session_id.to_string(),
+            body: body.to_string(),
+            queued_at: Utc::now().to_rfc3339(),
+        })
+        .exec(&mut db)
+        .await?;
+        Ok(())
+    }
+
+    /// Return all pending messages for `session_id`, in send order, as
+    /// `(id, body)` pairs — **without** removing them.
+    ///
+    /// Rows are deleted individually via [`delete_pending_message`](Self::delete_pending_message)
+    /// only after each message has been handed off for delivery, so a failure
+    /// mid-flush leaves undelivered messages durably queued (at-least-once).
+    pub async fn peek_pending_messages(
+        &self,
+        session_id: &str,
+    ) -> crate::error::Result<Vec<(u64, String)>> {
+        let mut db = self.db.clone();
+        let pending = PendingMessage::filter(PendingMessage::fields().session_id().eq(session_id))
+            .order_by(PendingMessage::fields().id().asc())
+            .exec(&mut db)
+            .await?;
+        Ok(pending.into_iter().map(|m| (m.id, m.body)).collect())
+    }
+
+    /// Delete a single pending message by its id (after it has been delivered).
+    pub async fn delete_pending_message(&self, id: u64) -> crate::error::Result<()> {
+        let mut db = self.db.clone();
+        PendingMessage::filter_by_id(id)
+            .delete()
+            .exec(&mut db)
+            .await?;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Team worklist
+    // -----------------------------------------------------------------------
+
+    /// Add an item to `team`'s worklist and return its numeric id.
+    pub async fn add_worklist_item(
+        &self,
+        team: &str,
+        item: &str,
+        posted_by: &str,
+    ) -> crate::error::Result<u64> {
+        let mut db = self.db.clone();
+        let created = toasty::create!(WorklistItem {
+            team: team.to_string(),
+            item: item.to_string(),
+            posted_by: posted_by.to_string(),
+            posted_at: Utc::now().to_rfc3339(),
+        })
+        .exec(&mut db)
+        .await?;
+        Ok(created.id)
+    }
+
+    /// Remove worklist item `id` from `team`. Returns whether a row was removed.
+    pub async fn remove_worklist_item(&self, team: &str, id: u64) -> crate::error::Result<bool> {
+        let mut db = self.db.clone();
+        let existing = WorklistItem::filter(WorklistItem::fields().team().eq(team))
+            .exec(&mut db)
+            .await?
+            .into_iter()
+            .any(|w| w.id == id);
+        if existing {
+            WorklistItem::filter_by_id(id)
+                .delete()
+                .exec(&mut db)
+                .await?;
+        }
+        Ok(existing)
+    }
+
+    /// The number of items on `team`'s worklist.
+    pub async fn worklist_count(&self, team: &str) -> crate::error::Result<usize> {
+        let mut db = self.db.clone();
+        Ok(WorklistItem::filter(WorklistItem::fields().team().eq(team))
+            .exec(&mut db)
+            .await?
+            .len())
+    }
+
+    /// All items on `team`'s worklist, in post order, as `(id, item, posted_by)`.
+    pub async fn worklist_items(
+        &self,
+        team: &str,
+    ) -> crate::error::Result<Vec<(u64, String, String)>> {
+        let mut db = self.db.clone();
+        Ok(WorklistItem::filter(WorklistItem::fields().team().eq(team))
+            .order_by(WorklistItem::fields().id().asc())
+            .exec(&mut db)
+            .await?
+            .into_iter()
+            .map(|w| (w.id, w.item, w.posted_by))
+            .collect())
+    }
+
+    // -----------------------------------------------------------------------
+    // Team key-value store
+    // -----------------------------------------------------------------------
+
+    /// Store `value` (JSON-encoded) under `key` for `team`, replacing any prior
+    /// value for that key.
+    pub async fn store_put(
+        &self,
+        team: &str,
+        key: &str,
+        value: &serde_json::Value,
+    ) -> crate::error::Result<()> {
+        let mut db = self.db.clone();
+        let encoded = serde_json::to_string(value)?;
+
+        // Replace any existing entry for this (team, key).
+        let existing: Vec<StoreEntry> = StoreEntry::filter(StoreEntry::fields().team().eq(team))
+            .exec(&mut db)
+            .await?
+            .into_iter()
+            .filter(|e| e.key == key)
+            .collect();
+        for entry in existing {
+            StoreEntry::filter_by_id(entry.id)
+                .delete()
+                .exec(&mut db)
+                .await?;
+        }
+
+        toasty::create!(StoreEntry {
+            team: team.to_string(),
+            key: key.to_string(),
+            value: encoded,
+            updated_at: Utc::now().to_rfc3339(),
+        })
+        .exec(&mut db)
+        .await?;
+        Ok(())
+    }
+
+    /// Retrieve the value stored under `key` for `team`, if present.
+    pub async fn store_get(
+        &self,
+        team: &str,
+        key: &str,
+    ) -> crate::error::Result<Option<serde_json::Value>> {
+        let mut db = self.db.clone();
+        let entry = StoreEntry::filter(StoreEntry::fields().team().eq(team))
+            .exec(&mut db)
+            .await?
+            .into_iter()
+            .find(|e| e.key == key);
+        match entry {
+            Some(e) => Ok(Some(serde_json::from_str(&e.value)?)),
+            None => Ok(None),
+        }
     }
 
     pub async fn record_trace(&self, trace: NewTrace) -> crate::error::Result<()> {
@@ -321,12 +683,23 @@ async fn table_exists_on(
     ))
 }
 
-async fn create_trace_schema(db: &toasty::Db) -> crate::error::Result<()> {
+/// Add missing tables to an existing database.
+///
+/// Diffs the current model schema against a copy with `table_names` removed, so
+/// the generated migration contains only the statements that create those
+/// tables (plus their indexes). Used to evolve older databases that predate a
+/// table without a full rebuild.
+///
+/// The removed tables must be a *suffix* of the registered models (toasty
+/// identifies tables by positional id, so removing a non-final table would
+/// shift the ids of surviving tables and corrupt the schema). Tables are only
+/// ever appended in this crate, so newly-missing tables are always a suffix.
+async fn add_missing_tables(db: &toasty::Db, table_names: &[&str]) -> crate::error::Result<()> {
     let next_schema = db.schema().db.clone();
     let mut previous_schema = next_schema.clone();
     previous_schema
         .tables
-        .retain(|table| table.name != "traces");
+        .retain(|table| !table_names.contains(&table.name.as_str()));
 
     let Some(generated) = toasty::migration::generate(
         db.driver(),
@@ -343,10 +716,6 @@ async fn create_trace_schema(db: &toasty::Db) -> crate::error::Result<()> {
         .await?;
 
     let result = async {
-        if table_exists_on(&mut conn, "traces").await? {
-            return Ok(());
-        }
-
         for statement in generated.migration.statements() {
             toasty::sql::statement(statement).exec(&mut conn).await?;
         }
@@ -599,5 +968,244 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn join_leave_and_list_teams() {
+        let store = Store::in_memory().await.unwrap();
+
+        assert!(store.list_teams().await.unwrap().is_empty());
+        assert_eq!(store.team_of_session("a").await.unwrap(), None);
+
+        store.join_team("a", "frontend").await.unwrap();
+        store.join_team("b", "frontend").await.unwrap();
+        store.join_team("c", "backend").await.unwrap();
+
+        assert_eq!(
+            store.team_of_session("a").await.unwrap().as_deref(),
+            Some("frontend")
+        );
+        assert_eq!(
+            store.list_teams().await.unwrap(),
+            vec!["backend".to_string(), "frontend".to_string()]
+        );
+        assert_eq!(
+            store.team_members("frontend").await.unwrap(),
+            vec!["a".to_string(), "b".to_string()]
+        );
+
+        store.leave_team("a").await.unwrap();
+        assert_eq!(store.team_of_session("a").await.unwrap(), None);
+        assert_eq!(
+            store.team_members("frontend").await.unwrap(),
+            vec!["b".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn joining_a_second_team_replaces_membership() {
+        let store = Store::in_memory().await.unwrap();
+
+        store.join_team("a", "frontend").await.unwrap();
+        store.join_team("a", "backend").await.unwrap();
+
+        // One-team-per-session: the session is only on the most recent team.
+        assert_eq!(
+            store.team_of_session("a").await.unwrap().as_deref(),
+            Some("backend")
+        );
+        assert!(store.team_members("frontend").await.unwrap().is_empty());
+        assert_eq!(
+            store.team_members("backend").await.unwrap(),
+            vec!["a".to_string()]
+        );
+        assert_eq!(
+            store.list_teams().await.unwrap(),
+            vec!["backend".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_session_clears_team_membership() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(&dir.path().join("jamsession.db"))
+            .await
+            .unwrap();
+        store.add_session("sess-1", dir.path()).await.unwrap();
+        store.join_team("sess-1", "frontend").await.unwrap();
+
+        store.remove_session("sess-1").await.unwrap();
+
+        assert_eq!(store.team_of_session("sess-1").await.unwrap(), None);
+        assert!(store.list_teams().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn team_membership_survives_reopen() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("jamsession.db");
+        {
+            let store = Store::open(&db_path).await.unwrap();
+            store.join_team("a", "frontend").await.unwrap();
+        }
+        let store = Store::open(&db_path).await.unwrap();
+        assert_eq!(
+            store.team_of_session("a").await.unwrap().as_deref(),
+            Some("frontend")
+        );
+    }
+
+    #[tokio::test]
+    async fn open_adds_team_table_to_existing_database() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("jamsession.db");
+        // Simulate a database created before the team_memberships table existed.
+        let old_db = toasty::Db::builder()
+            .models(toasty::models!(Session, Message, Trace))
+            .build(toasty_driver_sqlite::Sqlite::open(&db_path))
+            .await
+            .unwrap();
+        old_db.push_schema().await.unwrap();
+        drop(old_db);
+
+        let store = Store::open(&db_path).await.unwrap();
+        store.join_team("a", "frontend").await.unwrap();
+        assert_eq!(
+            store.team_of_session("a").await.unwrap().as_deref(),
+            Some("frontend")
+        );
+    }
+
+    #[tokio::test]
+    async fn peek_and_delete_pending_messages_in_order() {
+        let store = Store::in_memory().await.unwrap();
+
+        assert!(store.peek_pending_messages("a").await.unwrap().is_empty());
+
+        store.queue_message("a", "first").await.unwrap();
+        store.queue_message("a", "second").await.unwrap();
+        store.queue_message("b", "other").await.unwrap();
+
+        // Peek returns messages in send order WITHOUT removing them.
+        let peeked = store.peek_pending_messages("a").await.unwrap();
+        assert_eq!(
+            peeked.iter().map(|(_, b)| b.clone()).collect::<Vec<_>>(),
+            vec!["first".to_string(), "second".to_string()]
+        );
+        // Still present until explicitly deleted.
+        assert_eq!(store.peek_pending_messages("a").await.unwrap().len(), 2);
+
+        // Delete each by id; the queue drains one at a time.
+        store.delete_pending_message(peeked[0].0).await.unwrap();
+        assert_eq!(
+            store
+                .peek_pending_messages("a")
+                .await
+                .unwrap()
+                .iter()
+                .map(|(_, b)| b.clone())
+                .collect::<Vec<_>>(),
+            vec!["second".to_string()]
+        );
+        store.delete_pending_message(peeked[1].0).await.unwrap();
+        assert!(store.peek_pending_messages("a").await.unwrap().is_empty());
+
+        // "b" is unaffected.
+        assert_eq!(store.peek_pending_messages("b").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn removing_session_clears_pending_messages() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(&dir.path().join("jamsession.db"))
+            .await
+            .unwrap();
+        store.add_session("sess-1", dir.path()).await.unwrap();
+        store.queue_message("sess-1", "hi").await.unwrap();
+
+        store.remove_session("sess-1").await.unwrap();
+
+        assert!(
+            store
+                .peek_pending_messages("sess-1")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn worklist_post_show_remove() {
+        let store = Store::in_memory().await.unwrap();
+
+        assert_eq!(store.worklist_count("frontend").await.unwrap(), 0);
+
+        let id1 = store
+            .add_worklist_item("frontend", "set up fixtures", "agent-1")
+            .await
+            .unwrap();
+        let id2 = store
+            .add_worklist_item("frontend", "define API", "agent-2")
+            .await
+            .unwrap();
+        // A different team's worklist is independent.
+        store
+            .add_worklist_item("backend", "unrelated", "agent-3")
+            .await
+            .unwrap();
+
+        assert_eq!(store.worklist_count("frontend").await.unwrap(), 2);
+        let items = store.worklist_items("frontend").await.unwrap();
+        assert_eq!(
+            items,
+            vec![
+                (id1, "set up fixtures".to_string(), "agent-1".to_string()),
+                (id2, "define API".to_string(), "agent-2".to_string()),
+            ]
+        );
+
+        // Remove one item; the count drops and the other survives.
+        assert!(store.remove_worklist_item("frontend", id1).await.unwrap());
+        assert_eq!(store.worklist_count("frontend").await.unwrap(), 1);
+        // Removing a non-existent id is a no-op returning false.
+        assert!(!store.remove_worklist_item("frontend", 9999).await.unwrap());
+        // Cannot remove another team's item via the wrong team scope.
+        assert!(
+            !store
+                .remove_worklist_item("frontend", id2 + 100)
+                .await
+                .unwrap()
+        );
+
+        assert_eq!(store.worklist_count("backend").await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn store_put_get_and_replace() {
+        let store = Store::in_memory().await.unwrap();
+
+        assert_eq!(store.store_get("frontend", "url").await.unwrap(), None);
+
+        store
+            .store_put("frontend", "url", &serde_json::json!("http://a"))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.store_get("frontend", "url").await.unwrap(),
+            Some(serde_json::json!("http://a"))
+        );
+
+        // Overwriting the same key replaces the value (no duplicates).
+        store
+            .store_put("frontend", "url", &serde_json::json!({"port": 3000}))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.store_get("frontend", "url").await.unwrap(),
+            Some(serde_json::json!({"port": 3000}))
+        );
+
+        // Team scoping: another team does not see frontend's value.
+        assert_eq!(store.store_get("backend", "url").await.unwrap(), None);
     }
 }

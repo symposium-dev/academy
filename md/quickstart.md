@@ -61,6 +61,30 @@ To reconnect without receiving the history replay (e.g., your client already has
 {"jsonrpc": "2.0", "id": 1, "method": "session/list", "params": {"cwd": null, "cursor": null}}
 ```
 
+## Team collaboration
+
+The daemon exposes a single `jamsession` MCP tool to each agent and lets a human put agents on a shared **team**. Team membership is human-driven, via slash commands sent as ordinary prompts (the daemon intercepts them; the agent never sees them):
+
+```
+/jamsession:join-team frontend-refactor
+/jamsession:teams
+/jamsession:leave-team
+```
+
+Once on a team, an agent uses the `jamsession` tool to coordinate. Every call is a flat JSON object; `{"command": "help"}` returns the full command table:
+
+```json
+{"command": "list-members"}
+{"command": "broadcast", "message": "auth module ready"}
+{"command": "send", "to": "<agent-id>", "message": "can you export UserService?"}
+{"command": "post-worklist", "item": "define the /users contract"}
+{"command": "show-worklist"}
+{"command": "store", "key": "api-base-url", "value": "http://localhost:3000"}
+{"command": "retrieve", "key": "api-base-url"}
+```
+
+Messages route through the daemon, which delivers them to a live recipient immediately or queues them (durably) for delivery when the recipient's agent next wakes.
+
 ## ACP client mode
 
 `jamsession acp` bridges stdin/stdout to the daemon socket, so you can use it as a drop-in ACP transport from any tool that expects stdio-based ACP:

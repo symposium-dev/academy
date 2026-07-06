@@ -44,9 +44,10 @@ Each page includes anchor code references that link directly to the source.
 
 | Module | File | Role |
 |--------|------|------|
-| `dispatcher` | `src/dispatcher.rs` | Central dispatcher: message types, session state, routing, timers, trace recording, client/agent pipes |
+| `dispatcher` | `src/dispatcher.rs` | Central dispatcher: message types, session state, routing, timers, trace recording, client/agent pipes; also serves the `jamsession` MCP tool, intercepts `/jamsession:*` slash commands, injects context/messages into agents, and handles the effectful team commands (messaging, worklist, store) |
+| `jamsession_tool` | `src/jamsession_tool/` | The `jamsession` MCP tool: `command` (command enum + pure dispatch), `tool` (MCP shim forwarding to the dispatcher), `slash` (slash-command parsing/rendering), `message` (team-message rendering) |
 | `daemon` | `src/daemon.rs` | Socket listener, database opening, accept loop, scope-based task management |
-| `db` | `src/db.rs` | Toasty models plus SQLite-backed session, message, and trace persistence |
+| `db` | `src/db.rs` | Toasty models plus SQLite-backed persistence: sessions, messages, traces, team membership, pending team messages, worklist, and the shared key-value store |
 | `debug` | `src/debug.rs` | Local trace viewer server, `/api/traces` query handling, and JSON trace dumps |
 | `agent` | `src/agent.rs` | Agent factory trait, transport creation |
 | `session` | `src/session.rs` | `LifecycleEvent` enum (observable outcomes for tests/tracing) |

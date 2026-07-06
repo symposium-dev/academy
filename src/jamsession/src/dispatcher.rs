@@ -5,9 +5,9 @@ use std::sync::Arc;
 use agent_client_protocol::schema::{
     ContentChunk, InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
     LoadSessionRequest, LoadSessionResponse, McpServer, NewSessionRequest, NewSessionResponse,
-    PromptRequest, ProtocolVersion, ResumeSessionRequest, ResumeSessionResponse,
+    PromptRequest, PromptResponse, ProtocolVersion, ResumeSessionRequest, ResumeSessionResponse,
     SessionConfigOptionCategory, SessionId as AcpSessionId, SessionInfo, SessionNotification,
-    SessionUpdate, SetSessionConfigOptionRequest,
+    SessionUpdate, SetSessionConfigOptionRequest, StopReason,
 };
 use agent_client_protocol::util::MatchDispatch;
 use agent_client_protocol::{
@@ -24,6 +24,9 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::agent::AgentFactory;
 use crate::db::{NewTrace, SessionRecord, Store, TraceDirection, TraceKind};
+use crate::jamsession_tool::{
+    self, JamsessionTool, JamsessionToolCall, SlashCommand, ToolCallSender,
+};
 use crate::session::{LifecycleEvent, LifecycleEventSender};
 
 // ---------------------------------------------------------------------------
@@ -44,6 +47,7 @@ pub(super) enum DispatcherMessage {
     ClientRegistered {
         client_id: ClientId,
         outgoing_tx: mpsc::UnboundedSender<Dispatch>,
+        slash_reply_tx: mpsc::UnboundedSender<SlashReply>,
     },
     ClientDisconnected {
         client_id: ClientId,
@@ -51,6 +55,7 @@ pub(super) enum DispatcherMessage {
     AgentReady {
         agent_id: AgentId,
         outgoing_tx: mpsc::UnboundedSender<Dispatch>,
+        inject_tx: mpsc::UnboundedSender<String>,
         session_id: SessionId,
         client_id: ClientId,
         cwd: PathBuf,
@@ -96,6 +101,9 @@ pub(super) enum DispatcherMessage {
         from: String,
         to: String,
     },
+
+    // --- jamsession tool ---
+    JamsessionToolCall(JamsessionToolCall),
 }
 // ANCHOR_END: daemon-message
 
@@ -132,10 +140,27 @@ struct Session {
 
 struct ClientHandle {
     outgoing_tx: mpsc::UnboundedSender<Dispatch>,
+    /// Channel for delivering a slash-command reply as an ordered unit: the
+    /// agent-message notification followed by the terminating prompt response.
+    /// Both are emitted from the client pipe task (which owns the connection),
+    /// guaranteeing the reply text reaches the client before the response.
+    slash_reply_tx: mpsc::UnboundedSender<SlashReply>,
+}
+
+/// A slash-command reply to deliver to a client: an agent-message chunk (as an
+/// untyped `session/update` notification) followed by the `PromptResponse` that
+/// ends the turn. Delivered as a unit so the two cannot race.
+pub(super) struct SlashReply {
+    notification: agent_client_protocol::UntypedMessage,
+    responder: Responder<PromptResponse>,
 }
 
 struct AgentHandle {
     outgoing_tx: mpsc::UnboundedSender<Dispatch>,
+    /// Channel for injecting out-of-band context/messages into the agent's
+    /// conversation. Text sent here is delivered to the agent as a
+    /// `session/prompt` by the agent pipe. See [`Dispatcher::inject_to_agent`].
+    inject_tx: mpsc::UnboundedSender<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -184,6 +209,13 @@ pub(super) struct Dispatcher<'scope> {
     event_tx: Option<LifecycleEventSender>,
     dispatcher_tx: mpsc::UnboundedSender<DispatcherMessage>,
     trace: bool,
+    /// Whether to serve the `jamsession` MCP tool to agents. When enabled, new
+    /// sessions are wrapped in a conductor chain that serves the tool over
+    /// MCP-over-ACP. See [`crate::jamsession_tool`].
+    serve_jamsession_tool: bool,
+    /// Sender that agent-side tool instances use to forward tool calls into the
+    /// dispatcher loop (via a forwarder task spawned in [`Dispatcher::new`]).
+    tool_calls: ToolCallSender,
     next_agent_id: u64,
 }
 
@@ -200,7 +232,27 @@ impl<'scope> Dispatcher<'scope> {
         event_tx: Option<LifecycleEventSender>,
         dispatcher_tx: mpsc::UnboundedSender<DispatcherMessage>,
         trace: bool,
+        serve_jamsession_tool: bool,
     ) -> crate::error::Result<Self> {
+        // Tool instances live on agent connections and cannot name
+        // `DispatcherMessage` (it is private). They send `JamsessionToolCall`s
+        // over this channel; a forwarder task wraps each one into a
+        // `DispatcherMessage` so it is handled on the central loop.
+        let (tool_calls, mut tool_calls_rx) = mpsc::unbounded_channel::<JamsessionToolCall>();
+        {
+            let dispatcher_tx = dispatcher_tx.clone();
+            tokio::spawn(async move {
+                while let Some(call) = tool_calls_rx.recv().await {
+                    if dispatcher_tx
+                        .send(DispatcherMessage::JamsessionToolCall(call))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+        }
+
         let mut dispatcher = Self {
             tasks,
             clients: HashMap::new(),
@@ -218,6 +270,8 @@ impl<'scope> Dispatcher<'scope> {
             event_tx,
             dispatcher_tx,
             trace,
+            serve_jamsession_tool,
+            tool_calls,
             next_agent_id: 1,
         };
         dispatcher.rehydrate_from_store().await?;
@@ -254,8 +308,15 @@ impl<'scope> Dispatcher<'scope> {
             DispatcherMessage::ClientRegistered {
                 client_id,
                 outgoing_tx,
+                slash_reply_tx,
             } => {
-                self.clients.insert(client_id, ClientHandle { outgoing_tx });
+                self.clients.insert(
+                    client_id,
+                    ClientHandle {
+                        outgoing_tx,
+                        slash_reply_tx,
+                    },
+                );
                 self.trace_event(
                     None,
                     "acp-client",
@@ -271,6 +332,7 @@ impl<'scope> Dispatcher<'scope> {
             DispatcherMessage::AgentReady {
                 agent_id,
                 outgoing_tx,
+                inject_tx,
                 session_id,
                 client_id,
                 cwd,
@@ -279,6 +341,7 @@ impl<'scope> Dispatcher<'scope> {
                 self.handle_agent_ready(
                     agent_id,
                     outgoing_tx,
+                    inject_tx,
                     session_id,
                     client_id,
                     cwd,
@@ -347,6 +410,490 @@ impl<'scope> Dispatcher<'scope> {
                 )
                 .await;
             }
+            DispatcherMessage::JamsessionToolCall(call) => {
+                self.handle_tool_call(call).await;
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // jamsession tool
+    // -----------------------------------------------------------------------
+
+    /// Handle a `jamsession` tool invocation from an agent.
+    ///
+    /// The command logic lives in [`jamsession_tool`]; the dispatcher resolves
+    /// the calling agent's team context from daemon state, runs the command
+    /// against it, and returns the JSON response.
+    async fn handle_tool_call(&mut self, call: JamsessionToolCall) {
+        let JamsessionToolCall {
+            agent_id,
+            input,
+            respond,
+        } = call;
+
+        let session_id = self.agent_to_session.get(&agent_id).cloned();
+        self.trace_event(
+            session_id.clone(),
+            "agent",
+            "jamsession_tool_call",
+            input.clone(),
+        )
+        .await;
+
+        let ctx = self.team_context_for(session_id.as_deref()).await;
+
+        // Side-effecting team commands (messaging, worklist, store) touch other
+        // agents or the database, so the dispatcher handles them. Pure commands
+        // (help, list-members, and the membership errors) go to the command core.
+        let response = match effectful_command(&input, &ctx) {
+            Some(cmd) => self.handle_effectful_command(&ctx, cmd).await,
+            None => jamsession_tool::dispatch_json(input, &ctx),
+        };
+        // The agent may have gone away before we could answer; that is benign.
+        let _ = respond.send(response);
+    }
+
+    /// Handle a side-effecting team command against the caller's context.
+    async fn handle_effectful_command(
+        &self,
+        ctx: &jamsession_tool::TeamContext,
+        cmd: jamsession_tool::JamsessionCommand,
+    ) -> serde_json::Value {
+        use jamsession_tool::JamsessionCommand as C;
+        // Only reachable for on-team callers (see `effectful_command`).
+        let team = ctx.team.as_deref().unwrap_or_default();
+        match cmd {
+            C::Send { to, message } => self.handle_send(ctx, &to, &message).await,
+            C::Broadcast { message } => self.handle_broadcast(ctx, &message).await,
+            C::PostWorklist { item } => self.handle_post_worklist(team, ctx, &item).await,
+            C::RemoveWorklist { id } => self.handle_remove_worklist(team, &id).await,
+            C::ShowWorklist => self.handle_show_worklist(team).await,
+            C::Store { key, value } => self.handle_store(team, &key, value).await,
+            C::Retrieve { key } => self.handle_retrieve(team, &key).await,
+            // Non-effectful variants never reach here.
+            C::Help { .. } | C::ListMembers => serde_json::json!({
+                "error": "command not handled here",
+            }),
+        }
+    }
+
+    /// Handle `send`: deliver a direct message to one team member.
+    async fn handle_send(
+        &self,
+        ctx: &jamsession_tool::TeamContext,
+        to: &str,
+        message: &str,
+    ) -> serde_json::Value {
+        use jamsession_tool::{MessageKind, team_message};
+
+        // Recipient must be a member of the caller's team (and not the caller).
+        let is_member = ctx.members.iter().any(|m| m.id == to);
+        if !is_member || to == ctx.me {
+            return serde_json::json!({ "error": "unknown agent", "agent": to });
+        }
+
+        let text = team_message(&ctx.me, MessageKind::Direct, message);
+        self.deliver_team_message(to, text).await;
+        serde_json::json!({ "delivered": true })
+    }
+
+    /// Handle `broadcast`: deliver a message to all other team members.
+    async fn handle_broadcast(
+        &self,
+        ctx: &jamsession_tool::TeamContext,
+        message: &str,
+    ) -> serde_json::Value {
+        use jamsession_tool::{MessageKind, team_message};
+
+        let text = team_message(&ctx.me, MessageKind::Broadcast, message);
+        let mut delivered_to = Vec::new();
+        for member in &ctx.members {
+            if member.id == ctx.me {
+                continue;
+            }
+            self.deliver_team_message(&member.id, text.clone()).await;
+            delivered_to.push(member.id.clone());
+        }
+        serde_json::json!({ "delivered_to": delivered_to })
+    }
+
+    // -----------------------------------------------------------------------
+    // Worklist commands
+    // -----------------------------------------------------------------------
+
+    /// Handle `post-worklist`: add an item to the team's shared worklist.
+    async fn handle_post_worklist(
+        &self,
+        team: &str,
+        ctx: &jamsession_tool::TeamContext,
+        item: &str,
+    ) -> serde_json::Value {
+        match self.store.add_worklist_item(team, item, &ctx.me).await {
+            Ok(id) => {
+                let count = self.store.worklist_count(team).await.unwrap_or(0);
+                serde_json::json!({ "id": worklist_id(id), "items_count": count })
+            }
+            Err(e) => internal_command_error(e),
+        }
+    }
+
+    /// Handle `remove-worklist`: remove an item by its `wl-<n>` id.
+    async fn handle_remove_worklist(&self, team: &str, id: &str) -> serde_json::Value {
+        let Some(numeric) = parse_worklist_id(id) else {
+            return serde_json::json!({ "error": "unknown worklist id", "id": id });
+        };
+        match self.store.remove_worklist_item(team, numeric).await {
+            Ok(removed) => {
+                let count = self.store.worklist_count(team).await.unwrap_or(0);
+                if removed {
+                    serde_json::json!({ "removed": true, "items_count": count })
+                } else {
+                    serde_json::json!({ "error": "unknown worklist id", "id": id })
+                }
+            }
+            Err(e) => internal_command_error(e),
+        }
+    }
+
+    /// Handle `show-worklist`: list the team's worklist items.
+    async fn handle_show_worklist(&self, team: &str) -> serde_json::Value {
+        match self.store.worklist_items(team).await {
+            Ok(items) => {
+                let items: Vec<_> = items
+                    .into_iter()
+                    .map(|(id, item, posted_by)| {
+                        serde_json::json!({
+                            "id": worklist_id(id),
+                            "item": item,
+                            "posted_by": posted_by,
+                        })
+                    })
+                    .collect();
+                serde_json::json!({ "items": items })
+            }
+            Err(e) => internal_command_error(e),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Key-value store commands
+    // -----------------------------------------------------------------------
+
+    /// Handle `store`: put a key-value pair in the team's shared store.
+    async fn handle_store(
+        &self,
+        team: &str,
+        key: &str,
+        value: serde_json::Value,
+    ) -> serde_json::Value {
+        match self.store.store_put(team, key, &value).await {
+            Ok(()) => serde_json::json!({ "stored": true }),
+            Err(e) => internal_command_error(e),
+        }
+    }
+
+    /// Handle `retrieve`: get a value from the team's shared store.
+    async fn handle_retrieve(&self, team: &str, key: &str) -> serde_json::Value {
+        match self.store.store_get(team, key).await {
+            Ok(Some(value)) => serde_json::json!({ "key": key, "value": value }),
+            Ok(None) => serde_json::json!({ "error": "key not found", "key": key }),
+            Err(e) => internal_command_error(e),
+        }
+    }
+
+    /// Deliver a rendered team message to `recipient_session_id`: inject it into
+    /// the live agent if one is backing the session, else queue it for delivery
+    /// when the agent next becomes ready.
+    ///
+    /// The message is **always** durably queued first, then flushed if the
+    /// recipient's agent is live. Queue-first delivery gives at-least-once
+    /// semantics and closes the race where a recipient judged "live" is torn
+    /// down before an injected-but-unqueued message is consumed: such a message
+    /// stays queued and is delivered on the recipient's next activation.
+    async fn deliver_team_message(&self, recipient_session_id: &str, text: String) {
+        if let Err(e) = self.store.queue_message(recipient_session_id, &text).await {
+            tracing::error!(
+                recipient = recipient_session_id,
+                error = %e,
+                "failed to queue team message"
+            );
+            return;
+        }
+        if self.session_has_live_agent(recipient_session_id) {
+            self.flush_pending_messages(recipient_session_id).await;
+        }
+    }
+
+    /// Resolve the [`TeamContext`] for the agent owning `session_id`.
+    ///
+    /// Returns a team-less context if the session is unknown or not on a team.
+    /// A member's status is `active` when a live agent currently backs its
+    /// session, else `idle`.
+    async fn team_context_for(&self, session_id: Option<&str>) -> jamsession_tool::TeamContext {
+        use jamsession_tool::{MemberInfo, TeamContext};
+
+        let Some(session_id) = session_id else {
+            return TeamContext::default();
+        };
+        let team = match self.store.team_of_session(session_id).await {
+            Ok(team) => team,
+            Err(e) => {
+                tracing::error!(session_id, error = %e, "failed to read team membership");
+                None
+            }
+        };
+        let Some(team) = team else {
+            return TeamContext::none(session_id);
+        };
+
+        let member_ids = match self.store.team_members(&team).await {
+            Ok(ids) => ids,
+            Err(e) => {
+                // Log rather than silently returning an empty roster: the caller
+                // is on `team`, so an empty roster would be a plausible-but-wrong
+                // success that omits even the caller itself.
+                tracing::error!(session_id, team, error = %e, "failed to read team roster");
+                Vec::new()
+            }
+        };
+        let mut members = Vec::with_capacity(member_ids.len());
+        for id in member_ids {
+            let working_dir = self
+                .sessions
+                .get(&id)
+                .map(|s| s.record.cwd.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let status = if self.session_has_live_agent(&id) {
+                "active"
+            } else {
+                "idle"
+            };
+            members.push(MemberInfo {
+                id,
+                working_dir,
+                status: status.to_string(),
+            });
+        }
+
+        TeamContext {
+            team: Some(team),
+            me: session_id.to_string(),
+            members,
+        }
+    }
+
+    /// Whether `session_id` currently has a live agent backing it.
+    fn session_has_live_agent(&self, session_id: &str) -> bool {
+        self.sessions.get(session_id).is_some_and(|s| {
+            s.lifecycle_state != LifecycleState::AgentDead && self.agents.contains_key(&s.agent_id)
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Slash commands
+    // -----------------------------------------------------------------------
+
+    /// Handle a `/jamsession:*` slash command locally.
+    ///
+    /// The command is driven by the human, not the agent: the daemon updates
+    /// team state, persists both the user's command and its own reply (so they
+    /// replay on reconnect), answers the client, and — on a successful join —
+    /// injects a context message into the live agent. The agent is never sent
+    /// the slash command itself.
+    async fn handle_slash_command(
+        &mut self,
+        client_id: ClientId,
+        req: PromptRequest,
+        command: SlashCommand,
+        responder: Responder<PromptResponse>,
+    ) {
+        // The command and reply are part of the user-facing conversation, so
+        // persist the user's prompt like any other.
+        self.persist_user_message(client_id, &req).await;
+
+        let Some(session_id) = self.client_to_session.get(&client_id).cloned() else {
+            // No session yet: reply directly on the client connection (no
+            // session id to key an AgentMessageChunk or to persist against).
+            self.reply_without_session(
+                client_id,
+                "No active session; start one before using /jamsession commands.",
+                responder,
+            );
+            return;
+        };
+
+        let (reply, inject) = self.apply_slash_command(&session_id, command).await;
+
+        // Deliver the reply as an ordered unit (notification then response) so
+        // the reply text is guaranteed to reach the client before the turn ends.
+        self.reply_to_slash_command(client_id, &session_id, &reply, responder)
+            .await;
+
+        // Inject team context into the live agent (join only).
+        if let Some(context) = inject {
+            self.inject_to_agent(&session_id, context).await;
+        }
+    }
+
+    /// Apply the effects of a parsed slash command against team state, returning
+    /// the user-facing reply and any agent context to inject.
+    async fn apply_slash_command(
+        &mut self,
+        session_id: &str,
+        command: SlashCommand,
+    ) -> (String, Option<String>) {
+        use crate::jamsession_tool::slash;
+
+        match command {
+            SlashCommand::JoinTeam { team } => {
+                if let Err(e) = self.store.join_team(session_id, &team).await {
+                    return (format!("Failed to join team \"{team}\": {e}"), None);
+                }
+                let members = self.store.team_members(&team).await.unwrap_or_default();
+                let reply = format!(
+                    "Joined team \"{team}\". Members: {}.",
+                    if members.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        members.join(", ")
+                    }
+                );
+                let context = slash::join_context(&team, session_id, &members);
+                (reply, Some(context))
+            }
+            SlashCommand::LeaveTeam => match self.store.team_of_session(session_id).await {
+                Ok(Some(team)) => {
+                    if let Err(e) = self.store.leave_team(session_id).await {
+                        return (format!("Failed to leave team: {e}"), None);
+                    }
+                    (format!("Left team \"{team}\"."), None)
+                }
+                Ok(None) => ("You are not on a team.".to_string(), None),
+                Err(e) => (format!("Failed to leave team: {e}"), None),
+            },
+            SlashCommand::Teams => {
+                let teams = self.store.list_teams().await.unwrap_or_default();
+                if teams.is_empty() {
+                    return ("No active teams.".to_string(), None);
+                }
+                let mut lines = vec!["Active teams:".to_string()];
+                for team in teams {
+                    let members = self.store.team_members(&team).await.unwrap_or_default();
+                    lines.push(format!("  {team}: {}", members.join(", ")));
+                }
+                (lines.join("\n"), None)
+            }
+            SlashCommand::Invalid { message } => (message, None),
+        }
+    }
+
+    /// Send the daemon's reply to a slash command back to the client as an
+    /// agent-message notification followed by the terminating prompt response,
+    /// and persist the reply for replay.
+    ///
+    /// The notification and response are handed to the client pipe as a single
+    /// [`SlashReply`] so they are emitted in order on the connection; otherwise
+    /// the response could overtake the notification and the client would see an
+    /// empty turn.
+    async fn reply_to_slash_command(
+        &self,
+        client_id: ClientId,
+        session_id: &str,
+        reply: &str,
+        responder: Responder<PromptResponse>,
+    ) {
+        let notif = SessionNotification::new(
+            AcpSessionId::new(session_id.to_string()),
+            SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                agent_client_protocol::schema::ContentBlock::Text(
+                    agent_client_protocol::schema::TextContent::new(reply),
+                ),
+            )),
+        );
+        let untyped = match notif.to_untyped_message() {
+            Ok(u) => u,
+            Err(e) => {
+                tracing::error!(session_id, error = %e, "failed to encode slash reply");
+                let _ = responder.respond(PromptResponse::new(StopReason::EndTurn));
+                return;
+            }
+        };
+
+        // Persist so the reply replays on reconnect.
+        if let Ok(value) = serde_json::to_value(&untyped)
+            && let Err(e) = self.store.append_message(session_id, &value).await
+        {
+            tracing::error!(session_id, error = %e, "failed to persist slash reply");
+        }
+
+        // Deliver notification + response as an ordered unit via the client pipe.
+        if let Some(client) = self.clients.get(&client_id) {
+            let _ = client.slash_reply_tx.send(SlashReply {
+                notification: untyped,
+                responder,
+            });
+        } else {
+            // Client vanished; still answer the responder so it is not dropped.
+            let _ = responder.respond(PromptResponse::new(StopReason::EndTurn));
+        }
+    }
+
+    /// Reply to a slash command issued before any session exists.
+    ///
+    /// This is effectively unreachable in normal use — a client establishes a
+    /// session before it can prompt — but is handled defensively. There is no
+    /// session id to key a session-scoped `AgentMessageChunk` against, and an
+    /// error response would route into the connection's error handling rather
+    /// than the client's prompt result (leaving it to hang). So we simply end the
+    /// turn; the client gets an empty (but terminating) response rather than a
+    /// hang. `reply` is logged for diagnostics.
+    fn reply_without_session(
+        &self,
+        client_id: ClientId,
+        reply: &str,
+        responder: Responder<PromptResponse>,
+    ) {
+        tracing::warn!(client_id, %reply, "slash command before session established");
+        let _ = responder.respond(PromptResponse::new(StopReason::EndTurn));
+    }
+
+    /// Inject an out-of-band context/message prompt into a live agent.
+    ///
+    /// Returns whether the text was handed to a live agent's inject channel.
+    /// `false` if the session has no live agent (nothing was sent).
+    async fn inject_to_agent(&self, session_id: &str, text: String) -> bool {
+        let Some(session) = self.sessions.get(session_id) else {
+            return false;
+        };
+        match self.agents.get(&session.agent_id) {
+            Some(agent) => agent.inject_tx.send(text).is_ok(),
+            None => false,
+        }
+    }
+
+    /// Deliver any team messages queued for `session_id`, in send order, and
+    /// delete each only after it has been handed to the agent's inject channel.
+    ///
+    /// Messages are peeked (not bulk-taken) so a mid-flush failure — the agent
+    /// going away, or a channel send failing — leaves the undelivered remainder
+    /// durably queued for the next activation. This keeps delivery at-least-once.
+    async fn flush_pending_messages(&self, session_id: &str) {
+        let pending = match self.store.peek_pending_messages(session_id).await {
+            Ok(pending) => pending,
+            Err(e) => {
+                tracing::error!(session_id, error = %e, "failed to read pending messages");
+                return;
+            }
+        };
+        for (id, text) in pending {
+            if !self.inject_to_agent(session_id, text).await {
+                // Agent went away mid-flush; leave this and the rest queued.
+                break;
+            }
+            if let Err(e) = self.store.delete_pending_message(id).await {
+                tracing::error!(session_id, id, error = %e, "failed to delete delivered message");
+            }
         }
     }
 
@@ -414,16 +961,24 @@ impl<'scope> Dispatcher<'scope> {
     // Agent ready
     // -----------------------------------------------------------------------
 
+    #[expect(clippy::too_many_arguments)]
     async fn handle_agent_ready(
         &mut self,
         agent_id: AgentId,
         outgoing_tx: mpsc::UnboundedSender<Dispatch>,
+        inject_tx: mpsc::UnboundedSender<String>,
         session_id: SessionId,
         client_id: ClientId,
         cwd: PathBuf,
         responder: AgentReadyResponder,
     ) {
-        self.agents.insert(agent_id, AgentHandle { outgoing_tx });
+        self.agents.insert(
+            agent_id,
+            AgentHandle {
+                outgoing_tx,
+                inject_tx,
+            },
+        );
         self.agent_to_session.insert(agent_id, session_id.clone());
         self.trace_event(
             Some(session_id.clone()),
@@ -471,6 +1026,10 @@ impl<'scope> Dispatcher<'scope> {
         }
 
         self.client_to_session.insert(client_id, session_id.clone());
+
+        // Flush any team messages that were queued while this session's agent
+        // was not live, now that it is ready to receive them.
+        self.flush_pending_messages(&session_id).await;
 
         match responder {
             AgentReadyResponder::NewSession(r) => {
@@ -595,6 +1154,13 @@ impl<'scope> Dispatcher<'scope> {
             })
             .await
             .if_request(async |req: PromptRequest, responder| {
+                // Intercept `/jamsession:*` slash commands: the daemon handles
+                // them locally and never forwards them to the agent.
+                if let Some(command) = slash_command_of(&req) {
+                    self.handle_slash_command(client_id, req, command, responder)
+                        .await;
+                    return Ok(());
+                }
                 self.persist_user_message(client_id, &req).await;
                 let untyped = req.to_untyped_message().unwrap();
                 let dispatch = Dispatch::Request(untyped, responder.erase_to_json());
@@ -781,6 +1347,7 @@ impl<'scope> Dispatcher<'scope> {
                 return;
             }
         };
+        let transport = self.wrap_transport_with_tool(agent_id, transport);
 
         let _ = self.tasks.spawn(async move {
             agent_pipe(
@@ -1240,11 +1807,115 @@ impl<'scope> Dispatcher<'scope> {
         Ok(())
     }
 
+    /// Wrap an agent transport so the daemon serves the `jamsession` MCP tool
+    /// to it over MCP-over-ACP.
+    ///
+    /// When [`serve_jamsession_tool`](Self::serve_jamsession_tool) is disabled,
+    /// the transport is returned unchanged. Otherwise the agent is placed at the
+    /// end of a conductor chain fronted by two proxies: one that serves the
+    /// `jamsession` tool (bound to `agent_id`) and one that polyfills
+    /// MCP-over-ACP for agents lacking native support. Nested conductors
+    /// compose, so `inner` speaking ACP is all that is required of it.
+    ///
+    /// Note: only the `New` session path is wrapped today; see the
+    /// new-session-only limitation documented in the RFD.
+    fn wrap_transport_with_tool(
+        &self,
+        agent_id: AgentId,
+        inner: DynConnectTo<Client>,
+    ) -> DynConnectTo<Client> {
+        use agent_client_protocol::{Conductor, Proxy};
+        use agent_client_protocol_conductor::{ConductorImpl, ProxiesAndAgent};
+        use agent_client_protocol_polyfill::mcp_over_acp::McpOverAcpPolyfill;
+        use agent_client_protocol_rmcp::McpServerExt;
+
+        if !self.serve_jamsession_tool {
+            return inner;
+        }
+
+        let tool = JamsessionTool::new(agent_id, self.tool_calls.clone());
+        let mcp_server = agent_client_protocol::mcp_server::McpServer::<Conductor>::builder(
+            JamsessionTool::NAME,
+        )
+        .tool(tool)
+        .build();
+
+        let tool_proxy = Proxy
+            .builder()
+            .name("jamsession-tool")
+            .with_mcp_server(mcp_server);
+
+        let conductor = ConductorImpl::new_agent(
+            "jamsession-daemon-tool",
+            ProxiesAndAgent::new(inner)
+                .proxy(tool_proxy)
+                .proxy(McpOverAcpPolyfill::http()),
+        );
+
+        DynConnectTo::new(conductor)
+    }
+
     fn generate_agent_id(&mut self) -> AgentId {
         let id = self.next_agent_id;
         self.next_agent_id += 1;
         id
     }
+}
+
+/// Render a numeric worklist id as its public `wl-<n>` form.
+fn worklist_id(id: u64) -> String {
+    format!("wl-{id}")
+}
+
+/// Parse a public `wl-<n>` worklist id back to its numeric form.
+fn parse_worklist_id(id: &str) -> Option<u64> {
+    id.strip_prefix("wl-").and_then(|n| n.parse().ok())
+}
+
+/// A generic error response for a command whose underlying store operation
+/// failed. The error is logged; the agent sees a terse message.
+fn internal_command_error(e: crate::error::Error) -> serde_json::Value {
+    tracing::error!(error = %e, "jamsession command failed");
+    serde_json::json!({ "error": "internal error" })
+}
+
+/// Extract a side-effecting team command (messaging, worklist, store) from the
+/// raw tool input, but only when the caller is on a team.
+///
+/// Off-team callers return `None` so the request flows to the pure dispatch,
+/// which reports not-a-member. Malformed input and non-effectful commands
+/// (`help`, `list-members`) also return `None`, so the pure dispatch produces
+/// the right response (single source of truth for those messages).
+fn effectful_command(
+    input: &serde_json::Value,
+    ctx: &jamsession_tool::TeamContext,
+) -> Option<jamsession_tool::JamsessionCommand> {
+    use jamsession_tool::JamsessionCommand as C;
+    ctx.team.as_ref()?;
+    match serde_json::from_value::<C>(input.clone()) {
+        Ok(
+            cmd @ (C::Send { .. }
+            | C::Broadcast { .. }
+            | C::PostWorklist { .. }
+            | C::RemoveWorklist { .. }
+            | C::ShowWorklist
+            | C::Store { .. }
+            | C::Retrieve { .. }),
+        ) => Some(cmd),
+        _ => None,
+    }
+}
+
+/// If `req`'s leading text block is a `/jamsession:*` slash command, parse it.
+///
+/// Only the first text block is inspected; that is where a slash command lives.
+fn slash_command_of(req: &PromptRequest) -> Option<crate::jamsession_tool::SlashCommand> {
+    use agent_client_protocol::schema::ContentBlock;
+    let text = req.prompt.iter().find_map(|block| match block {
+        ContentBlock::Text(t) => Some(t.text.as_str()),
+        _ => None,
+    })?;
+    crate::jamsession_tool::slash::parse(text)
 }
 
 fn json_id_to_string(id: &serde_json::Value) -> String {
@@ -1265,10 +1936,12 @@ pub(super) async fn client_pipe(
     dispatcher_tx: mpsc::UnboundedSender<DispatcherMessage>,
 ) {
     let (outgoing_tx, outgoing_rx) = mpsc::unbounded_channel::<Dispatch>();
+    let (slash_reply_tx, mut slash_reply_rx) = mpsc::unbounded_channel::<SlashReply>();
 
     let _ = dispatcher_tx.send(DispatcherMessage::ClientRegistered {
         client_id,
         outgoing_tx,
+        slash_reply_tx,
     });
 
     let (read_half, write_half) = stream.into_split();
@@ -1300,8 +1973,31 @@ pub(super) async fn client_pipe(
                 });
                 let mut outgoing =
                     std::pin::pin!(UnboundedReceiverStream::new(outgoing_rx).take_until(eof_fut));
-                while let Some(dispatch) = outgoing.next().await {
-                    cx.send_proxied_message(dispatch)?;
+                // Once the slash-reply channel closes (client handle dropped),
+                // stop selecting on it to avoid busy-looping.
+                let mut slash_open = true;
+                loop {
+                    tokio::select! {
+                        maybe_dispatch = outgoing.next() => {
+                            match maybe_dispatch {
+                                Some(dispatch) => cx.send_proxied_message(dispatch)?,
+                                None => break,
+                            }
+                        }
+                        maybe_reply = slash_reply_rx.recv(), if slash_open => {
+                            match maybe_reply {
+                                Some(SlashReply { notification, responder }) => {
+                                    // Emit the reply text, then end the turn — in
+                                    // this order, on this connection, so the client
+                                    // sees the text before the response.
+                                    let notif: Dispatch = Dispatch::Notification(notification);
+                                    cx.send_proxied_message(notif)?;
+                                    responder.respond(PromptResponse::new(StopReason::EndTurn))?;
+                                }
+                                None => slash_open = false,
+                            }
+                        }
+                    }
                 }
                 Ok(())
             })
@@ -1342,6 +2038,32 @@ struct AgentSpawnRequest {
     default_model: Option<String>,
 }
 
+/// Deliver `text` to the agent as a `session/prompt`, out of band.
+///
+/// Used for daemon-originated context and team messages. The prompt response is
+/// ignored: injection is fire-and-forget, and errors on the response leg would
+/// only reflect agent-side handling, not delivery.
+fn inject_prompt(
+    cx: &agent_client_protocol::ConnectionTo<agent_client_protocol::Agent>,
+    session_id: &str,
+    text: String,
+) -> Result<(), agent_client_protocol::Error> {
+    use agent_client_protocol::schema::{ContentBlock, PromptRequest, TextContent};
+
+    // Send the prompt on a spawned task and swallow its result. Injection is
+    // fire-and-forget: we do not want a canceled response (which happens when
+    // the connection is torn down before the agent replies, e.g. right after a
+    // client disconnects) to surface as a connection error and kill the agent.
+    let sent = cx.send_request(PromptRequest::new(
+        AcpSessionId::new(session_id),
+        vec![ContentBlock::Text(TextContent::new(text))],
+    ));
+    cx.spawn(async move {
+        let _ = sent.block_task().await;
+        Ok(())
+    })
+}
+
 async fn agent_pipe(
     transport: DynConnectTo<Client>,
     dispatcher_tx: mpsc::UnboundedSender<DispatcherMessage>,
@@ -1350,6 +2072,9 @@ async fn agent_pipe(
 ) {
     let agent_id = spawn_request.agent_id;
     let (outgoing_tx, outgoing_rx) = mpsc::unbounded_channel::<Dispatch>();
+    // Out-of-band context/message injection: text sent here becomes a
+    // `session/prompt` to the agent (see the outgoing loop below).
+    let (inject_tx, mut inject_rx) = mpsc::unbounded_channel::<String>();
     let responder_slot: Arc<std::sync::Mutex<Option<AgentReadyResponder>>> =
         Arc::new(std::sync::Mutex::new(Some(responder)));
 
@@ -1367,6 +2092,9 @@ async fn agent_pipe(
                     .block_task()
                     .await?;
 
+                // The session id, captured for the injection loop below.
+                let session_id_for_inject;
+
                 match spawn_request.request {
                     SessionRequest::New {
                         ref cwd,
@@ -1380,6 +2108,7 @@ async fn agent_pipe(
                             .await?;
 
                         let session_id = resp.session_id.0.to_string();
+                        session_id_for_inject = session_id.clone();
 
                         if let Some(ref desired_model) = spawn_request.default_model {
                             set_model_config_option(
@@ -1419,6 +2148,7 @@ async fn agent_pipe(
                         let _ = dispatcher_tx.send(DispatcherMessage::AgentReady {
                             agent_id,
                             outgoing_tx,
+                            inject_tx,
                             session_id,
                             client_id: spawn_request.client_id,
                             cwd: cwd.clone(),
@@ -1430,6 +2160,7 @@ async fn agent_pipe(
                         ref cwd,
                         ref mcp_servers,
                     } => {
+                        session_id_for_inject = session_id.clone();
                         cx.send_request(
                             ResumeSessionRequest::new(AcpSessionId::new(session_id.as_str()), cwd)
                                 .mcp_servers(mcp_servers.clone()),
@@ -1451,6 +2182,7 @@ async fn agent_pipe(
                         let _ = dispatcher_tx.send(DispatcherMessage::AgentReady {
                             agent_id,
                             outgoing_tx,
+                            inject_tx,
                             session_id: session_id.clone(),
                             client_id: spawn_request.client_id,
                             cwd: cwd.clone(),
@@ -1464,8 +2196,25 @@ async fn agent_pipe(
                 });
                 let mut outgoing =
                     std::pin::pin!(UnboundedReceiverStream::new(outgoing_rx).take_until(eof_fut));
-                while let Some(dispatch) = outgoing.next().await {
-                    cx.send_proxied_message(dispatch)?;
+                // Once the injection channel closes (the agent handle was
+                // dropped), stop selecting on it so we don't busy-loop; the
+                // outgoing stream still drives termination.
+                let mut inject_open = true;
+                loop {
+                    tokio::select! {
+                        maybe_dispatch = outgoing.next() => {
+                            match maybe_dispatch {
+                                Some(dispatch) => cx.send_proxied_message(dispatch)?,
+                                None => break,
+                            }
+                        }
+                        maybe_text = inject_rx.recv(), if inject_open => {
+                            match maybe_text {
+                                Some(text) => inject_prompt(&cx, &session_id_for_inject, text)?,
+                                None => inject_open = false,
+                            }
+                        }
+                    }
                 }
                 Ok(())
             }

@@ -7,6 +7,7 @@ Jamsession is a daemon that manages the lifecycle of AI coding agents using the 
 - **Single entry point** -- Clients connect to one Unix socket (`~/.jamsession/daemon.sock`). The daemon handles spawning, bridging, and lifecycle for all sessions.
 - **One client per session** -- When a new client takes over a session, the previous one is disconnected automatically.
 - **Opt-in message tracing** -- When `trace = true`, ACP dispatches and daemon lifecycle events are recorded in SQLite. Inspect them in the browser with `jamsession debug serve` or emit JSON with `jamsession debug dump`.
+- **Inter-agent collaboration** -- The daemon exposes a single `jamsession` MCP tool to each agent (help, list-members, broadcast, send, worklist, and a shared key-value store). A human puts agents on a **team** with the `/jamsession:join-team` slash command; teamed agents then coordinate through the daemon, which routes and persists their messages.
 
 ## How it works
 
