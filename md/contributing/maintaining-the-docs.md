@@ -55,6 +55,7 @@ When one of these happens, update the matching page(s) before you consider the w
 | Observable behavior changes / something ships | The relevant [architecture](../design/README.md) page (reconcile it with what now exists) |
 | A new subsystem, flow, or mechanism is built | Add/update the matching [architecture](../design/README.md) page or flow diagram |
 | A new module, or a change in how modules relate | The **Module map** in [architecture](../design/README.md) |
+| A cross-cutting, load-bearing decision is made or changed | Add/update an entry in [Architecture decisions](../design/decisions.md) with a new `D<n>` code; a feature-local decision stays in its RFD and is linked from there |
 | A new term worth defining | [`terminology.md`](../terminology.md) |
 | Any new page | Register it in [`SUMMARY.md`](../SUMMARY.md) — a page not listed there does not render |
 
