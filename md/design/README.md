@@ -1,6 +1,17 @@
-# Design and implementation
+# Architecture & Design
 
-This section documents the internal architecture of Jamsession for contributors and anyone curious about how the daemon works.
+This section is the **design of record** for Jamsession: the single, coherent picture of the
+system's intended architecture — the *destination*. It describes how the system is meant to be
+built, independent of the sequence of changes that got us there.
+
+It works together with the [RFDs](../rfds/README.md): **an RFD describes a change — the
+*journey*; these pages describe the resulting *destination*.** An RFD may propose a change to
+the architecture itself, not only an implementation plan; when it does, the agreed end-state is
+reflected here so this section always shows the current intended design as a whole. Because
+design is worked out in RFDs *and* here, this section can run ahead of the code — what matters
+is that a reader can tell built from planned (the [Build-Out
+Roadmap](../implementation/roadmap.md) carries that status; see [Maintaining this
+book](../contributing/maintaining-the-docs.md) for the update contract).
 
 ## How to read these docs
 

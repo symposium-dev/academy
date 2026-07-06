@@ -38,4 +38,4 @@ The daemon is the sole ACP endpoint for clients -- they never communicate direct
 
 ## Project status
 
-Academy is in active development. The core session lifecycle (create, load, resume, idle spin-down, respawn) is implemented. See the [quick start guide](./quickstart.md) to try it out.
+Jamsession is in active development. The core session lifecycle (create, load, resume, idle spin-down, respawn) is implemented. See the [quick start guide](./quickstart.md) to try it out.
