@@ -1,17 +1,17 @@
 # Architecture & Design
 
 This section is the **design of record** for Jamsession: the single, coherent picture of the
-system's intended architecture. It is where we work through the design of the whole system —
-both the parts already built and the parts we're still figuring out — before any of it is
-carved into an [RFD](../rfds/README.md) and implemented.
+system's intended architecture — the *destination*. It describes how the system is meant to be
+built, independent of the sequence of changes that got us there.
 
-It **leads** the RFDs rather than summarizing them. We think a design through here first; an
-RFD then proposes a specific, reviewable *delta* drawn from this section and takes it to
-implementation. So this section runs ahead of the code: today it mostly describes what already
-exists, but that is just where the worked-out design happens to reach so far, not a limit on
-what belongs here. Forward-looking design is welcome — what matters is that a reader can tell
-built from planned (the [Build-Out Roadmap](../implementation/roadmap.md) carries that status; see
-[Maintaining this book](../contributing/maintaining-the-docs.md) for the update contract).
+It works together with the [RFDs](../rfds/README.md): **an RFD describes a change — the
+*journey*; these pages describe the resulting *destination*.** An RFD may propose a change to
+the architecture itself, not only an implementation plan; when it does, the agreed end-state is
+reflected here so this section always shows the current intended design as a whole. Because
+design is worked out in RFDs *and* here, this section can run ahead of the code — what matters
+is that a reader can tell built from planned (the [Build-Out
+Roadmap](../implementation/roadmap.md) carries that status; see [Maintaining this
+book](../contributing/maintaining-the-docs.md) for the update contract).
 
 ## How to read these docs
 

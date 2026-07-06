@@ -9,38 +9,31 @@ follow-up.
 
 The rest of this page is written in the imperative, addressed to that agent.
 
-## How the pieces relate — the Architecture section vs. RFDs
+## How the pieces relate — the Architecture section and RFDs
 
-Jamsession keeps two kinds of design document. They are not competitors and not two tenses of
-the same fact; they sit at **different stages of the same pipeline**:
-
-```text
-Architecture & Design  →  RFD  →  Implementation
-(work out the intended     (propose a specific,   (build the delta,
- design of the system)      reviewable delta)       track it to done)
-```
+Jamsession keeps two kinds of design document. They are complementary views of the same
+system: **RFDs describe the journey, the architecture pages describe the destination.**
 
 | | Architecture & Design | RFD |
 |---|---|---|
-| Role | the *design of record* — the intended architecture of the whole | a *change* (a delta) drawn from it |
-| Scope | the system, built and planned together | one specific proposal at one time |
-| Answers | *how is the system meant to be built?* | *what change are we making next, and why?* |
-| Lifespan | living, leads the work | historical once completed |
+| Describes | the *destination* — the intended architecture as a whole | a *change* — the journey to get there |
+| Answers | *how is the system meant to be built?* | *what change are we making, and why?* |
+| Lifespan | living, kept current | historical once completed |
 
-The **Architecture & Design** section is the upstream design workspace: it holds the coherent,
-intended design of the whole system, and it is where we think a design through *before* it
-becomes a change proposal. An **RFD** then carves a specific, reviewable delta out of that
-design and takes it to implementation. Design flows **from** the architecture (an RFD is a
-delta against the intended design) — the architecture **leads**, RFDs follow.
+An **RFD** proposes and discusses a change. That change is often architectural — an RFD can
+describe how the architecture itself should evolve, not only an implementation plan and its
+steps. The **Architecture & Design** section records the destination those changes converge
+on, as a single present-and-intended picture, so the current design never has to be
+reconstructed by replaying every RFD.
 
 Two practical consequences:
 
-- **Forward-looking design belongs in the architecture, not only in RFDs.** It is expected
-  that this section runs ahead of the code and describes parts not yet built.
-- **A reader must be able to tell built from planned.** Never let a not-yet-built design read
-  as if it already exists — someone (or some agent) will build *on* it. Mark planned parts
-  as such and let the **Build-Out Roadmap** carry the authoritative done/in-flight/planned
-  status; keep the architecture prose at the design level.
+- **An RFD can carry architectural design, not just implementation steps.** Don't force
+  architectural reasoning out of an RFD; that is a normal part of proposing a change.
+- **Keep the destination current.** When an RFD lands an architectural change, reflect the
+  agreed end-state in the relevant architecture page so this section stays the coherent whole.
+  A reader must be able to tell built from planned (the **Build-Out Roadmap** carries the
+  authoritative done/in-flight/planned status).
 
 ## When to update — trigger → page
 
@@ -48,8 +41,8 @@ When one of these happens, update the matching page(s) before you consider the w
 
 | Trigger | Update these pages |
 |---|---|
-| We work out (or revise) how part of the system *should* be designed | The relevant [architecture](../design/README.md) page — capture the intended design, marking anything not yet built as planned |
-| A worked-out design is ready to build | Open an **RFD** (`md/rfds/<name>/`) per the [RFD process](../rfds/README.md) carving out the delta; track steps in its `implementation.md` |
+| We settle (or revise) how part of the system *should* be designed | The relevant [architecture](../design/README.md) page — record the intended destination, marking anything not yet built as planned |
+| We're planning a change (including an architectural one) | Open an **RFD** (`md/rfds/<name>/`) per the [RFD process](../rfds/README.md) to describe and discuss it; track steps in its `implementation.md`. When it lands an architectural change, reflect the end-state in the [architecture](../design/README.md) page |
 | An RFD's implementation step lands | Tick the step in that RFD's `implementation.md` — this is the only place per-step status lives; do **not** touch the roadmap |
 | An RFD is accepted (merged, in progress) | Move it to *Accepted* in [`SUMMARY.md`](../SUMMARY.md) and [`accepted.md`](../rfds/accepted.md); flip its group to **In flight** in the [Build-Out Roadmap](../implementation/roadmap.md) |
 | An RFD completes | Move it to *Completed* in [`SUMMARY.md`](../SUMMARY.md) and [`completed.md`](../rfds/completed.md); update the relevant [architecture](../design/README.md) page; flip its group to **Done** in the [Build-Out Roadmap](../implementation/roadmap.md) |
