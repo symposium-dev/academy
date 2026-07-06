@@ -2,10 +2,23 @@
 
 - [What is Jamsession?](./README.md)
 - [Quick start guide](./quickstart.md)
+- [Terminology](./terminology.md)
 
 # Reference
 
 - [Configuration](./configuration.md)
+
+# Architecture & Design
+
+- [Overview](./design/README.md)
+  - [Key sequence diagrams](./design/sequence_diagrams.md)
+    - [Flow: new session](./design/flow-new-session.md)
+    - [Flow: reconnect (load/resume)](./design/flow-reconnect.md)
+    - [Flow: message bridge](./design/flow-message-bridge.md)
+    - [Flow: idle spin-down](./design/flow-idle-spindown.md)
+    - [Flow: agent crash](./design/flow-agent-crash.md)
+    - [Flow: cwd health check](./design/flow-cwd-health.md)
+    - [Flow: message trace](./design/flow-message-trace.md)
 
 # RFDs
 
@@ -25,14 +38,6 @@
   - [Message trace & debug viewer](./rfds/message-trace/README.md)
     - [Implementation plan and status](./rfds/message-trace/implementation.md)
 
-# Appendices
+# Contributing
 
-- [Design and implementation](./design/README.md)
-  - [Key sequence diagrams](./design/sequence_diagrams.md)
-    - [Flow: new session](./design/flow-new-session.md)
-    - [Flow: reconnect (load/resume)](./design/flow-reconnect.md)
-    - [Flow: message bridge](./design/flow-message-bridge.md)
-    - [Flow: idle spin-down](./design/flow-idle-spindown.md)
-    - [Flow: agent crash](./design/flow-agent-crash.md)
-    - [Flow: cwd health check](./design/flow-cwd-health.md)
-    - [Flow: message trace](./design/flow-message-trace.md)
+- [Maintaining this book](./contributing/maintaining-the-docs.md)

@@ -1,6 +1,13 @@
-# Design and implementation
+# Architecture & Design
 
-This section documents the internal architecture of Jamsession for contributors and anyone curious about how the daemon works.
+This section is the present-tense description of how Jamsession is built **right now** — the
+single, coherent picture of the daemon's internal architecture for contributors and anyone
+curious about how it works.
+
+It complements the [RFDs](../rfds/README.md): an RFD describes a *change* ("we will do X"),
+while this section describes the accumulated *end-state* ("X is built this way"). When an RFD
+completes, its durable design belongs here in present tense — see
+[Maintaining this book](../contributing/maintaining-the-docs.md) for the update contract.
 
 ## How to read these docs
 
