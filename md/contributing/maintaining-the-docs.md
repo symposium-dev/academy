@@ -65,19 +65,26 @@ When a change touches more than one row, update all of them in the same change.
 - **Ground built claims in the code, use anchors not line numbers.** For anything described as existing, tie statements to
   actual modules/files and keep code-anchor references accurate. Planned design is grounded in
   the design discussion instead, and is labelled as planned.
-- **Every page is in the nav spine.** Add its [`SUMMARY.md`](../SUMMARY.md) entry in the same
-  edit that creates the page.
 - **Diagrams use Mermaid** in fenced ` ```mermaid ` blocks.
 - **Style** (inherited from the RFD process): no promotional or dramatic language; be factual
   and brief; lead with concrete concepts, then generalize; include examples.
 
 ## Verify before you commit
 
-Build the book and confirm your pages render and the nav is intact:
+Build the book locally — this is the same check CI runs on the PR, so it catches problems
+before you push:
 
 ```bash
-mdbook serve
+mdbook build   # or `mdbook serve` to preview and rebuild on save
 ```
 
-Confirm the new/edited page appears in the sidebar and that content and intra-book links
-resolve. Then commit.
+The build surfaces the two things easiest to get wrong:
+
+- **Orphaned pages** — a `.md` under `md/` that isn't listed in [`SUMMARY.md`](../SUMMARY.md)
+  warns ("not linked to in SUMMARY.md") and won't render. Add every new page to `SUMMARY.md`
+  in the same edit that creates it.
+- **Stale anchors** — a broken `ANCHOR` cross-reference between docs and source reports
+  "unknown anchor"; CI fails on these.
+
+Then confirm the new/edited page appears in the sidebar and that content and intra-book links
+resolve, and commit.
