@@ -69,7 +69,7 @@ When a change touches more than one row, update all of them in the same change.
   may cover parts not yet implemented — that is the point of the section. But mark planned
   design clearly (a status note, or defer the detail to the Build-Out Roadmap) so nothing
   reads as built when it isn't.
-- **Ground built claims in the code.** For anything described as existing, tie statements to
+- **Ground built claims in the code, use anchors not line numbers.** For anything described as existing, tie statements to
   actual modules/files and keep code-anchor references accurate. Planned design is grounded in
   the design discussion instead, and is labelled as planned.
 - **Every page is in the nav spine.** Add its [`SUMMARY.md`](../SUMMARY.md) entry in the same
