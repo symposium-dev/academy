@@ -51,10 +51,7 @@ end links to them so they are discoverable without duplicating their reasoning.
   respawned on demand via `session/resume`. Conversation history is persisted and replayed by
   the daemon, never by the agent — agents only ever receive `session/new` (first time) or
   `session/resume` (every reconnect).
-- **Why:** Frees resources held by idle agents while keeping the session alive, and keeps the
-  agent contract minimal: an agent never has to know about, store, or replay history. That
-  makes the daemon the single source of truth for a session and lets any reconnect be handled
-  uniformly.
+- **Why:** In ACP, the agent is typically responsible for "replaying" sessions to the client. The Daemon may be proxying multiple clients to one background agent and therefore may have to replay the same session multiple times to each client. Storing the data simplifies this. It also permits the daemon to add additional "meta-events" (e.g., joining a team) that the agent is not aware of.
 - **Grounding:** [Architecture & Design](./README.md) → "Ephemeral agents";
   [Session persistence RFD](../rfds/session-persistence/README.md);
   [terminology](../terminology.md) → "Agent", "Respawn".
