@@ -1,13 +1,17 @@
 # Architecture & Design
 
-This section is the present-tense description of how Jamsession is built **right now** — the
-single, coherent picture of the daemon's internal architecture for contributors and anyone
-curious about how it works.
+This section is the **design of record** for Jamsession: the single, coherent picture of the
+system's intended architecture. It is where we work through the design of the whole system —
+both the parts already built and the parts we're still figuring out — before any of it is
+carved into an [RFD](../rfds/README.md) and implemented.
 
-It complements the [RFDs](../rfds/README.md): an RFD describes a *change* ("we will do X"),
-while this section describes the accumulated *end-state* ("X is built this way"). When an RFD
-completes, its durable design belongs here in present tense — see
-[Maintaining this book](../contributing/maintaining-the-docs.md) for the update contract.
+It **leads** the RFDs rather than summarizing them. We think a design through here first; an
+RFD then proposes a specific, reviewable *delta* drawn from this section and takes it to
+implementation. So this section runs ahead of the code: today it mostly describes what already
+exists, but that is just where the worked-out design happens to reach so far, not a limit on
+what belongs here. Forward-looking design is welcome — what matters is that a reader can tell
+built from planned (the Build-Out Roadmap, forthcoming, will carry that status; see
+[Maintaining this book](../contributing/maintaining-the-docs.md) for the update contract).
 
 ## How to read these docs
 
